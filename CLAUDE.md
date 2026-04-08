@@ -15,20 +15,22 @@ Target: Windows, single NVIDIA GPU, llama.cpp prebuilt CUDA binaries.
 
 ---
 
-## Current phase: Phase 1 (MVP)
+## Current phase: Phase 2 complete
 
-**Implemented:**
+**Implemented (Phase 1):**
 - Profile loader (`profiles.py`) — YAML → Pydantic models, CLI-arg builder
 - Process manager (`process_manager.py`) — spawn/kill state machine, stderr capture
 - Non-streaming proxy (`proxy.py`) — error classification, httpx forwarding
 - FastAPI app (`main.py`) — routes, lifespan, OrcError exception handler
 - Config (`config.py`) — pydantic-settings, all env vars
 
-**Not yet implemented (Phase 2+):**
-- Streaming responses (raw SSE passthrough)
-- Idle reaper (auto-unload after `IDLE_TTL_SECONDS`)
-- `/admin/load`, `/admin/unload` (admin-key-gated)
-- `/admin/custom_run` (ad-hoc flag set, Phase 3)
+**Implemented (Phase 2):**
+- Streaming proxy (`proxy.py`) — raw SSE passthrough via `proxy_chat_completions_stream`; connection + status-code check happens before first yield so `OrcError` can still be raised cleanly
+- Idle reaper (`process_manager.py`) — `start_idle_reaper` / `stop_idle_reaper`, polls every 30 s, evicts after `IDLE_TTL_SECONDS` (disabled when TTL ≤ 0)
+- `/admin/load` and `/admin/unload` (`main.py`) — `X-Admin-Key` header auth via `require_admin` dependency
+
+**Not yet implemented (Phase 3):**
+- `/admin/custom_run` (ad-hoc flag set)
 
 ---
 
@@ -40,7 +42,7 @@ Target: Windows, single NVIDIA GPU, llama.cpp prebuilt CUDA binaries.
 | `config.py` | `Settings` (pydantic-settings), module-level `settings` singleton |
 | `profiles.py` | `ModelProfile`, `ProfilesFile`, `load_profiles()`, `build_cli_args()` |
 | `process_manager.py` | `ChildState` enum, `OrcError` exception, `ChildInfo` dataclass, `ProcessManager` class |
-| `proxy.py` | `classify_stderr()`, `proxy_chat_completions()` |
+| `proxy.py` | `classify_stderr()`, `proxy_chat_completions()`, `proxy_chat_completions_stream()` |
 | `profiles.yaml.example` | Template profile file — copy to `profiles.yaml` |
 | `.env.example` | All env vars with defaults — copy to `.env` |
 | `requirements.txt` | Python deps |
@@ -92,14 +94,16 @@ All prefixed `ORCHESTRATOR_`. See `.env.example` for full list.
 
 ---
 
-## Endpoints (Phase 1)
+## Endpoints
 
 | Method | Path | Notes |
 |--------|------|-------|
 | GET | `/healthz` | Always `{"status": "ok"}` |
 | GET | `/status` | State machine status + PID |
 | GET | `/v1/models` | Lists profiles from YAML |
-| POST | `/v1/chat/completions` | Non-streaming only in Phase 1 |
+| POST | `/v1/chat/completions` | Streaming and non-streaming |
+| POST | `/admin/load` | Pre-load model; requires `X-Admin-Key` |
+| POST | `/admin/unload` | Unload model; requires `X-Admin-Key` |
 
 ---
 
@@ -116,14 +120,21 @@ All prefixed `ORCHESTRATOR_`. See `.env.example` for full list.
 
 ## Development branch
 
-`claude/review-orchestrator-plan-mFKE8`
+`claude/complete-readme-phases-zR4aB`
 
 ---
 
 ## Session log
 
-### 2026-04-08
+### 2026-04-08 (session 1)
 - Initial implementation: Phase 1 MVP complete
 - Created: `main.py`, `config.py`, `profiles.py`, `process_manager.py`, `proxy.py`
 - Created: `requirements.txt`, `.env.example`, `profiles.yaml.example`, `README.md`, `CLAUDE.md`
 - Added "Future / next iterations" section to README covering: session-scoped logging + rolling log files, usage metrics (`/metrics` endpoint), multi-backend / load balancing layer with per-profile backend URL lists
+
+### 2026-04-08 (session 2)
+- Phase 2 complete
+- `proxy.py`: added `proxy_chat_completions_stream()` — connection + header check before first yield, SSE passthrough via nested `_gen()` async generator
+- `process_manager.py`: added `_last_used_at` tracking in `ensure_model()`, `start_idle_reaper()` / `stop_idle_reaper()`, `_idle_reaper_loop()` (30 s poll, evicts after `IDLE_TTL_SECONDS`)
+- `main.py`: `stream` field on `ChatCompletionRequest`, streaming branch in `chat_completions` route, `require_admin` dependency, `/admin/load` and `/admin/unload` endpoints, reaper lifecycle in lifespan
+- Updated README and CLAUDE.md to reflect Phase 2 complete

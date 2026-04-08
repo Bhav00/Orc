@@ -2,6 +2,7 @@ import asyncio
 import enum
 import logging
 import socket
+import time
 from collections import deque
 from dataclasses import dataclass, field
 
@@ -55,6 +56,8 @@ class ProcessManager:
         self._child: ChildInfo | None = None
         self._lock: asyncio.Lock = asyncio.Lock()
         self._profiles: ProfilesFile | None = None
+        self._last_used_at: float | None = None
+        self._reaper_task: asyncio.Task | None = None
 
     def set_profiles(self, profiles: ProfilesFile) -> None:
         self._profiles = profiles
@@ -74,6 +77,7 @@ class ProcessManager:
             and self._child.model_id == model_id
             and self._is_child_alive()
         ):
+            self._last_used_at = time.monotonic()
             return
 
         async with self._lock:
@@ -84,6 +88,7 @@ class ProcessManager:
                 and self._child.model_id == model_id
                 and self._is_child_alive()
             ):
+                self._last_used_at = time.monotonic()
                 return
 
             # Kill whatever is currently running (any non-IDLE state)
@@ -107,12 +112,25 @@ class ProcessManager:
                 )
 
             await self._spawn(model_id, profile)
+            self._last_used_at = time.monotonic()
 
     async def kill_current(self) -> None:
         """Force-unload the current model. Safe to call when already IDLE."""
         async with self._lock:
             if self._state != ChildState.IDLE:
                 await self._kill_and_wait()
+
+    def start_idle_reaper(self) -> None:
+        """Start the background task that evicts idle models. No-op if TTL is 0."""
+        if self._settings.idle_ttl_seconds > 0:
+            self._reaper_task = asyncio.create_task(
+                self._idle_reaper_loop(), name="idle-reaper"
+            )
+
+    def stop_idle_reaper(self) -> None:
+        """Cancel the idle reaper task."""
+        if self._reaper_task and not self._reaper_task.done():
+            self._reaper_task.cancel()
 
     def get_status(self) -> dict:
         return {
@@ -261,6 +279,23 @@ class ProcessManager:
             raise
         except Exception as exc:
             log.warning("Stderr reader exited unexpectedly: %s", exc)
+
+    async def _idle_reaper_loop(self) -> None:
+        """Background task: evict the loaded model after IDLE_TTL_SECONDS of inactivity."""
+        while True:
+            await asyncio.sleep(30)
+            if (
+                self._state == ChildState.READY
+                and self._last_used_at is not None
+                and (time.monotonic() - self._last_used_at) > self._settings.idle_ttl_seconds
+            ):
+                model_id = self._child.model_id if self._child else "unknown"
+                log.info(
+                    "Model %r idle for >%ds — unloading",
+                    model_id,
+                    self._settings.idle_ttl_seconds,
+                )
+                await self.kill_current()
 
     def _is_child_alive(self) -> bool:
         return self._child is not None and self._child.process.returncode is None

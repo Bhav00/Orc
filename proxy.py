@@ -1,4 +1,5 @@
 import logging
+from collections.abc import AsyncGenerator
 
 import httpx
 
@@ -30,13 +31,11 @@ async def proxy_chat_completions(
     process_manager: ProcessManager,
     child_port: int,
 ) -> dict:
-    """Forward a /v1/chat/completions request to the child and return parsed JSON.
+    """Forward a non-streaming /v1/chat/completions request to the child.
 
-    Non-streaming only (Phase 1): forces stream=False regardless of what the
-    client sent. Raises OrcError on any failure, with the child's stderr tail
-    included for diagnostics.
+    Forces stream=False. Raises OrcError on any failure, with the child's
+    stderr tail included for diagnostics.
     """
-    # Phase 1: non-streaming only
     request_body = {**request_body, "stream": False}
 
     url = f"http://127.0.0.1:{child_port}/v1/chat/completions"
@@ -98,3 +97,60 @@ async def proxy_chat_completions(
         "\n".join(stderr),
     )
     raise OrcError(status, emsg, error_type=etype, stderr_tail=stderr)
+
+
+async def proxy_chat_completions_stream(
+    request_body: dict,
+    process_manager: ProcessManager,
+    child_port: int,
+) -> AsyncGenerator[bytes, None]:
+    """Initiate a streaming /v1/chat/completions request to the child.
+
+    Establishes the connection and checks the status code before returning, so
+    OrcError can still be raised and caught by FastAPI's exception handler.
+    Returns an async generator that yields raw SSE byte chunks.
+    """
+    url = f"http://127.0.0.1:{child_port}/v1/chat/completions"
+    client = httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=5.0))
+
+    try:
+        response = await client.send(
+            client.build_request("POST", url, json=request_body),
+            stream=True,
+        )
+    except httpx.ConnectError:
+        await client.aclose()
+        process_manager._state = ChildState.DYING
+        stderr = process_manager.get_stderr_tail(30)
+        raise OrcError(503, "Child process is unreachable", error_type="child_unreachable", stderr_tail=stderr)
+    except httpx.ReadTimeout:
+        await client.aclose()
+        stderr = process_manager.get_stderr_tail(30)
+        raise OrcError(504, "Child process timed out", error_type="child_timeout", stderr_tail=stderr)
+
+    if response.status_code != 200:
+        await response.aread()
+        await client.aclose()
+        stderr = process_manager.get_stderr_tail(30)
+        status, etype, emsg = classify_stderr(stderr)
+        try:
+            body = response.json()
+            if isinstance(body.get("error"), dict):
+                emsg = body["error"].get("message", emsg)
+        except Exception:
+            pass
+        log.warning("Child returned HTTP %d for streaming request. Classified as %s.", response.status_code, etype)
+        raise OrcError(status, emsg, error_type=etype, stderr_tail=stderr)
+
+    async def _gen() -> AsyncGenerator[bytes, None]:
+        try:
+            async for chunk in response.aiter_bytes():
+                yield chunk
+        except (httpx.ReadError, httpx.RemoteProtocolError) as exc:
+            process_manager._state = ChildState.DYING
+            log.warning("Streaming connection lost mid-stream: %s", exc)
+        finally:
+            await response.aclose()
+            await client.aclose()
+
+    return _gen()

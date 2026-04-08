@@ -1,14 +1,14 @@
 import logging
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
 from config import settings
 from process_manager import OrcError, ProcessManager
 from profiles import load_profiles
-from proxy import proxy_chat_completions
+from proxy import proxy_chat_completions, proxy_chat_completions_stream
 
 logging.basicConfig(
     level=logging.INFO,
@@ -24,9 +24,14 @@ log = logging.getLogger("orc.main")
 class ChatCompletionRequest(BaseModel):
     model: str
     messages: list[dict]
+    stream: bool = False
     # All extra fields (temperature, top_p, max_tokens, tools, etc.) are
     # preserved and forwarded as-is to the child.
     model_config = {"extra": "allow"}
+
+
+class AdminLoadRequest(BaseModel):
+    model: str
 
 
 # ---------------------------------------------------------------------------
@@ -41,12 +46,14 @@ async def lifespan(app: FastAPI):
 
     pm = ProcessManager(settings)
     pm.set_profiles(profiles)
+    pm.start_idle_reaper()
     app.state.process_manager = pm
     app.state.profiles = profiles
 
     yield
 
     log.info("Shutting down — unloading any running model")
+    pm.stop_idle_reaper()
     await pm.kill_current()
 
 
@@ -54,7 +61,19 @@ async def lifespan(app: FastAPI):
 # App
 # ---------------------------------------------------------------------------
 
-app = FastAPI(title="Orc", version="0.1.0", lifespan=lifespan)
+app = FastAPI(title="Orc", version="0.2.0", lifespan=lifespan)
+
+
+# ---------------------------------------------------------------------------
+# Auth dependency
+# ---------------------------------------------------------------------------
+
+def require_admin(x_admin_key: str | None = Header(None)) -> None:
+    """FastAPI dependency: validates the X-Admin-Key header."""
+    if settings.admin_key is None:
+        raise HTTPException(status_code=503, detail="Admin key not configured on this server")
+    if x_admin_key != settings.admin_key:
+        raise HTTPException(status_code=401, detail="Invalid or missing X-Admin-Key header")
 
 
 # ---------------------------------------------------------------------------
@@ -108,16 +127,53 @@ async def list_models(request: Request) -> dict:
 
 
 @app.post("/v1/chat/completions")
-async def chat_completions(body: ChatCompletionRequest, request: Request) -> dict:
+async def chat_completions(body: ChatCompletionRequest, request: Request):
     pm: ProcessManager = request.app.state.process_manager
 
     await pm.ensure_model(body.model)
 
+    body_dict = body.model_dump()
+
+    if body.stream:
+        gen = await proxy_chat_completions_stream(
+            request_body=body_dict,
+            process_manager=pm,
+            child_port=settings.child_port,
+        )
+        return StreamingResponse(gen, media_type="text/event-stream")
+
     return await proxy_chat_completions(
-        request_body=body.model_dump(),
+        request_body=body_dict,
         process_manager=pm,
         child_port=settings.child_port,
     )
+
+
+# ---------------------------------------------------------------------------
+# Admin endpoints (Phase 2)
+# ---------------------------------------------------------------------------
+
+@app.post("/admin/load")
+async def admin_load(
+    body: AdminLoadRequest,
+    request: Request,
+    _: None = Depends(require_admin),
+) -> dict:
+    """Pre-load a model into VRAM. Requires X-Admin-Key header."""
+    pm: ProcessManager = request.app.state.process_manager
+    await pm.ensure_model(body.model)
+    return {"status": "ok", "model": body.model}
+
+
+@app.post("/admin/unload")
+async def admin_unload(
+    request: Request,
+    _: None = Depends(require_admin),
+) -> dict:
+    """Unload the currently running model. Requires X-Admin-Key header."""
+    pm: ProcessManager = request.app.state.process_manager
+    await pm.kill_current()
+    return {"status": "ok"}
 
 
 # ---------------------------------------------------------------------------

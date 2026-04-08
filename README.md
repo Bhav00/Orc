@@ -94,16 +94,26 @@ uvicorn main:app --host 127.0.0.1 --port 8080
 
 ---
 
-## Endpoints (Phase 1)
+## Endpoints
 
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/healthz` | Liveness check — always returns `{"status": "ok"}` |
 | GET | `/status` | Current state, loaded model ID, child PID |
 | GET | `/v1/models` | List all profiles from `profiles.yaml` |
-| POST | `/v1/chat/completions` | OpenAI-compatible, non-streaming (Phase 1) |
+| POST | `/v1/chat/completions` | OpenAI-compatible, streaming and non-streaming |
+| POST | `/admin/load` | Pre-load a model into VRAM (requires `X-Admin-Key`) |
+| POST | `/admin/unload` | Unload the running model (requires `X-Admin-Key`) |
 
-Phase 2 will add streaming, idle reaper, and admin endpoints (`/admin/load`, `/admin/unload`). Phase 3 adds `/admin/custom_run`.
+Phase 3 adds `/admin/custom_run` (ad-hoc flag override).
+
+### Admin endpoints
+
+Both `/admin/*` routes require an `X-Admin-Key` header matching `ORCHESTRATOR_ADMIN_KEY`.  
+If `ORCHESTRATOR_ADMIN_KEY` is not set, all admin routes return `503`.
+
+**`POST /admin/load`** — body: `{"model": "<model-id>"}`  
+**`POST /admin/unload`** — no body required
 
 ---
 
@@ -185,12 +195,11 @@ All variables are prefixed `ORCHESTRATOR_`. Defaults are shown.
 
 ---
 
-## Known limitations (Phase 1)
+## Known limitations
 
-- **Non-streaming only.** `stream: true` requests are silently forced to `stream: false`.
-- **No idle eviction.** The model stays loaded until the next model-switch or server restart.
 - **Sampling defaults not merged.** The `sampling_defaults` block in profiles is informational; clients must send their own sampling parameters.
 - **Profiles loaded once at startup.** Restart the server to pick up `profiles.yaml` changes.
+- **Streaming mid-stream errors.** If the child dies after the first SSE chunk is sent, the client receives an incomplete stream (HTTP headers are already committed). Pre-stream errors (connection failure, non-200 status) are still surfaced as structured JSON.
 
 ---
 
