@@ -191,3 +191,45 @@ All variables are prefixed `ORCHESTRATOR_`. Defaults are shown.
 - **No idle eviction.** The model stays loaded until the next model-switch or server restart.
 - **Sampling defaults not merged.** The `sampling_defaults` block in profiles is informational; clients must send their own sampling parameters.
 - **Profiles loaded once at startup.** Restart the server to pick up `profiles.yaml` changes.
+
+---
+
+## Future / next iterations
+
+### Session-scoped logging with rolling log files
+
+Every request should be assigned a `session_id` (or accept one via header, e.g. `X-Session-ID`). All log lines — orchestrator events, proxied request metadata, child stderr lines — should be tagged with that ID so a single session's full trace can be pulled from the log file.
+
+Log files should roll on size and/or date (e.g. `logs/orc-2026-04-08.log`, max 50 MB, keep last 14 days). Python's `logging.handlers.TimedRotatingFileHandler` or `RotatingFileHandler` covers this. The in-memory stderr deque stays as the fast-path for error responses; the log files are the durable audit trail.
+
+Things to log per request: session ID, model ID, request timestamp, prompt token count (from response usage field), completion token count, latency ms, HTTP status returned to client, and any stderr lines emitted during that request.
+
+### Usage metrics
+
+Currently nothing is counted. At minimum the orchestrator should track:
+
+- **Per-model:** total requests, total prompt tokens, total completion tokens, total errors, average latency
+- **Per-session (if session IDs are implemented):** same breakdown scoped to the session
+- **Process-level:** number of spawns, number of kills, total VRAM-load time, model currently loaded + how long it has been loaded
+
+These should be exposed on a `GET /metrics` endpoint — either Prometheus format (for scraping) or a simple JSON summary. No external dependency is required for the JSON path; Prometheus export can use the `prometheus-client` library when needed.
+
+Counters should survive model swaps (i.e. live on the orchestrator, not the child process). They reset on orchestrator restart unless persisted, which is fine for v1.
+
+### Multi-backend / load balancing
+
+The current design assumes a single `llama-server.exe` on a single machine. The next step is to allow the profile registry to list multiple backend URLs instead of always spawning a local process. Each backend is a running `llama-server` instance, possibly on a different machine or port, and Orc acts as a routing layer in front of them.
+
+Proposed profile extension:
+```yaml
+models:
+  qwen2.5-14b-q5:
+    backends:
+      - url: "http://10.0.0.1:8090"
+      - url: "http://10.0.0.2:8090"
+    # ... rest of profile unchanged
+```
+
+When multiple backends are listed for a model, Orc load-balances across them (round-robin or least-connections). For Phase 1 compatibility, a profile with no `backends` key falls back to the current local-spawn behaviour.
+
+**Same models on all endpoints:** for now the assumption is that every backend listed under a model profile actually has that model loaded or can load it. A model availability checker (health + model-list probe against each backend) is already planned as a separate pipeline component and will feed into backend selection here. Backends that fail the health check are removed from rotation until they recover.

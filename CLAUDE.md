@@ -126,3 +126,4 @@ All prefixed `ORCHESTRATOR_`. See `.env.example` for full list.
 - Initial implementation: Phase 1 MVP complete
 - Created: `main.py`, `config.py`, `profiles.py`, `process_manager.py`, `proxy.py`
 - Created: `requirements.txt`, `.env.example`, `profiles.yaml.example`, `README.md`, `CLAUDE.md`
+- Added "Future / next iterations" section to README covering: session-scoped logging + rolling log files, usage metrics (`/metrics` endpoint), multi-backend / load balancing layer with per-profile backend URL lists
