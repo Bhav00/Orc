@@ -1,0 +1,50 @@
+# profiles.yaml.example
+# Copy to profiles.yaml and update model_path values for your machine.
+#
+# The "models" keys are the model IDs used in API requests:
+#   POST /v1/chat/completions  { "model": "qwen2.5-14b-q5", ... }
+#
+# Flag mapping:
+#   YAML key  "ctx_size"      → CLI arg  "--ctx-size"
+#   YAML key  "flash_attn"    → CLI arg  "--flash-attn"   (boolean true = flag only, false = omit)
+#   Any llama-server flag can go in the flags block; unknown flags are passed through and
+#   llama-server will report errors for invalid ones (captured in stderr_tail).
+#
+# sampling_defaults are documented here for reference but are NOT automatically
+# merged into requests in Phase 1. Clients must send their own sampling params.
+#
+# estimated_vram_mb is a rough figure used for a pre-spawn sanity check only.
+# It does not represent actual VRAM measurement.
+
+models:
+  qwen2.5-14b-q5:
+    display_name: "Qwen2.5 14B Instruct (Q5_K_M)"
+    model_path: "C:/models/qwen2.5-14b-instruct-q5_k_m.gguf"
+    estimated_vram_mb: 12000
+    flags:
+      ctx_size: 8192
+      n_gpu_layers: 99
+      flash_attn: true
+      cache_type_k: q8_0
+      cache_type_v: q8_0
+      parallel: 1
+    sampling_defaults:
+      temperature: 0.2
+      top_p: 0.9
+    chat_template: null   # null = let llama-server auto-detect from the GGUF metadata
+
+  qwen2.5-7b-q6:
+    display_name: "Qwen2.5 7B Instruct (Q6_K)"
+    model_path: "C:/models/qwen2.5-7b-instruct-q6_k.gguf"
+    estimated_vram_mb: 7000
+    flags:
+      ctx_size: 16384
+      n_gpu_layers: 99
+      flash_attn: true
+      cache_type_k: q8_0
+      cache_type_v: q8_0
+      parallel: 1
+    sampling_defaults:
+      temperature: 0.7
+      top_p: 0.95
+    chat_template: null
