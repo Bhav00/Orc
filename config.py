@@ -23,5 +23,8 @@ class Settings(BaseSettings):
     idle_ttl_seconds: int = Field(600)
     admin_key: str | None = Field(None)
 
+    # Logging
+    log_dir: str = Field("logs")
+
 
 settings = Settings()

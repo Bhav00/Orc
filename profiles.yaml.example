@@ -4,14 +4,23 @@
 # The "models" keys are the model IDs used in API requests:
 #   POST /v1/chat/completions  { "model": "qwen2.5-14b-q5", ... }
 #
-# Flag mapping:
+# Two profile modes:
+#
+#   LOCAL SPAWN (default) — Orc spawns llama-server.exe locally.
+#     Required fields: model_path, plus any flags you want to pass.
+#
+#   REMOTE BACKENDS — Orc routes to already-running llama-server instances.
+#     Required field: backends (list of {url: ...}).
+#     model_path and flags are ignored in this mode.
+#
+# Flag mapping (local spawn only):
 #   YAML key  "ctx_size"      → CLI arg  "--ctx-size"
 #   YAML key  "flash_attn"    → CLI arg  "--flash-attn"   (boolean true = flag only, false = omit)
 #   Any llama-server flag can go in the flags block; unknown flags are passed through and
 #   llama-server will report errors for invalid ones (captured in stderr_tail).
 #
 # sampling_defaults are documented here for reference but are NOT automatically
-# merged into requests in Phase 1. Clients must send their own sampling params.
+# merged into requests. Clients must send their own sampling params.
 #
 # estimated_vram_mb is a rough figure used for a pre-spawn sanity check only.
 # It does not represent actual VRAM measurement.
@@ -48,3 +57,11 @@ models:
       temperature: 0.7
       top_p: 0.95
     chat_template: null
+
+  # --- Remote backends example ---
+  # Orc routes to these URLs round-robin. No local process is spawned.
+  # qwen2.5-14b-remote:
+  #   display_name: "Qwen2.5 14B (remote cluster)"
+  #   backends:
+  #     - url: "http://10.0.0.1:8090"
+  #     - url: "http://10.0.0.2:8090"

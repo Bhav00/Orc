@@ -10,12 +10,13 @@ Orc is a thin FastAPI orchestrator that wraps `llama-server.exe` (llama.cpp). It
 - Exposes a single OpenAI-compatible API endpoint for all downstream apps
 - Manages one `llama-server.exe` child process at a time (swap on model change)
 - Captures child stderr and returns it in structured error responses (the core value prop)
+- Optionally routes to remote llama-server backends (round-robin, no local spawn)
 
 Target: Windows, single NVIDIA GPU, llama.cpp prebuilt CUDA binaries.
 
 ---
 
-## Current phase: Phase 2 complete
+## Current phase: All phases complete
 
 **Implemented (Phase 1):**
 - Profile loader (`profiles.py`) — YAML → Pydantic models, CLI-arg builder
@@ -29,8 +30,11 @@ Target: Windows, single NVIDIA GPU, llama.cpp prebuilt CUDA binaries.
 - Idle reaper (`process_manager.py`) — `start_idle_reaper` / `stop_idle_reaper`, polls every 30 s, evicts after `IDLE_TTL_SECONDS` (disabled when TTL ≤ 0)
 - `/admin/load` and `/admin/unload` (`main.py`) — `X-Admin-Key` header auth via `require_admin` dependency
 
-**Not yet implemented (Phase 3):**
-- `/admin/custom_run` (ad-hoc flag set)
+**Implemented (Phase 3 + future iterations):**
+- `/admin/custom_run` — kills current, merges caller-supplied flags on top of profile flags, respawns; local-spawn profiles only
+- Session-scoped logging — `SessionMiddleware` reads/generates `X-Session-ID`; rolling files via `TimedRotatingFileHandler` (`logs/orc.log` and `logs/requests.jsonl`); per-request JSON log line in `chat_completions` handler
+- Usage metrics — `MetricsStore` (`metrics.py`); per-model request/token/error/latency counters; process-level spawn/kill counts; `GET /metrics` endpoint
+- Multi-backend routing — `backends: [{url: ...}]` in profile skips local spawn and routes to remote URLs round-robin via `BackendRouter`; `proxy.py` refactored to take `target_url: str` and optional `ProcessManager`
 
 ---
 
@@ -38,9 +42,10 @@ Target: Windows, single NVIDIA GPU, llama.cpp prebuilt CUDA binaries.
 
 | File | Purpose |
 |------|---------|
-| `main.py` | FastAPI app, routes, lifespan, `OrcError` exception handler |
+| `main.py` | FastAPI app, routes, `SessionMiddleware`, `BackendRouter`, lifespan, `OrcError` exception handler |
 | `config.py` | `Settings` (pydantic-settings), module-level `settings` singleton |
-| `profiles.py` | `ModelProfile`, `ProfilesFile`, `load_profiles()`, `build_cli_args()` |
+| `metrics.py` | `MetricsStore` — in-process per-model and process-level counters |
+| `profiles.py` | `ModelProfile`, `BackendEntry`, `ProfilesFile`, `load_profiles()`, `build_cli_args()` |
 | `process_manager.py` | `ChildState` enum, `OrcError` exception, `ChildInfo` dataclass, `ProcessManager` class |
 | `proxy.py` | `classify_stderr()`, `proxy_chat_completions()`, `proxy_chat_completions_stream()` |
 | `profiles.yaml.example` | Template profile file — copy to `profiles.yaml` |
@@ -58,6 +63,8 @@ Target: Windows, single NVIDIA GPU, llama.cpp prebuilt CUDA binaries.
 5. **`post_kill_delay` runs while the lock is held.** The sleep in `_kill_and_wait()` is intentional — it blocks new spawns until VRAM is expected to have drained on Windows.
 6. **Fail fast on bad profiles YAML.** `load_profiles()` is called at startup; a malformed file crashes the server before it accepts connections.
 7. **`OrcError` is defined in `process_manager.py`**, imported by `proxy.py` and `main.py`. Do not move it without updating imports.
+8. **`proxy.py` functions take `target_url: str`**, not a port number. The URL is assembled by the caller (`main.py`). `process_manager` parameter is `None` for remote backends.
+9. **`custom_run` always kills first.** It never takes the fast path — even if the same model is loaded — because the flags may differ.
 
 ---
 
@@ -91,6 +98,9 @@ All prefixed `ORCHESTRATOR_`. See `.env.example` for full list.
 - `SPAWN_TIMEOUT_SECONDS` — max wait for health check (default 60)
 - `POST_KILL_DELAY_SECONDS` — VRAM drain wait after kill (default 2.0)
 - `VRAM_TOTAL_MB` / `VRAM_RESERVE_MB` — sanity check limits
+- `IDLE_TTL_SECONDS` — idle eviction timeout; 0 = disabled (default 600)
+- `ADMIN_KEY` — required for `/admin/*` routes
+- `LOG_DIR` — directory for rolling log files (default `logs`)
 
 ---
 
@@ -100,10 +110,12 @@ All prefixed `ORCHESTRATOR_`. See `.env.example` for full list.
 |--------|------|-------|
 | GET | `/healthz` | Always `{"status": "ok"}` |
 | GET | `/status` | State machine status + PID |
-| GET | `/v1/models` | Lists profiles from YAML |
+| GET | `/v1/models` | Lists profiles from YAML; includes `backend_mode` field |
 | POST | `/v1/chat/completions` | Streaming and non-streaming |
+| GET | `/metrics` | Per-model + process-level counters (JSON) |
 | POST | `/admin/load` | Pre-load model; requires `X-Admin-Key` |
 | POST | `/admin/unload` | Unload model; requires `X-Admin-Key` |
+| POST | `/admin/custom_run` | Spawn with flag overrides; requires `X-Admin-Key` |
 
 ---
 
@@ -138,3 +150,15 @@ All prefixed `ORCHESTRATOR_`. See `.env.example` for full list.
 - `process_manager.py`: added `_last_used_at` tracking in `ensure_model()`, `start_idle_reaper()` / `stop_idle_reaper()`, `_idle_reaper_loop()` (30 s poll, evicts after `IDLE_TTL_SECONDS`)
 - `main.py`: `stream` field on `ChatCompletionRequest`, streaming branch in `chat_completions` route, `require_admin` dependency, `/admin/load` and `/admin/unload` endpoints, reaper lifecycle in lifespan
 - Updated README and CLAUDE.md to reflect Phase 2 complete
+
+### 2026-04-09 (session 3)
+- Phase 3 + future iterations complete
+- `metrics.py` (new): `MetricsStore` with per-model request/token/latency counters and process-level spawn/kill tracking
+- `profiles.py`: added `BackendEntry`, made `model_path`/`estimated_vram_mb`/`flags` optional, added `backends: list[BackendEntry]`, added `model_validator` enforcing model_path OR backends
+- `process_manager.py`: added `set_metrics()`, wired `record_spawn()` / `record_kill()` into `_spawn()` / `_kill_and_wait()`; added `custom_run()` (kills current, merges flags, respawns)
+- `proxy.py`: refactored `child_port: int` → `target_url: str`; `process_manager` is now `Optional`; added `_stderr()` helper; logging now shows `target_url`
+- `main.py`: added `SessionMiddleware`, `BackendRouter`, `MetricsStore` wiring; `chat_completions` now routes local vs remote, records metrics, logs JSON request line; added `/metrics`, `/admin/custom_run` endpoints; updated `/admin/load` for remote-backend profiles; version bumped to 0.3.0
+- `config.py`: added `log_dir` setting
+- `.env.example`: added `ORCHESTRATOR_LOG_DIR`
+- `profiles.yaml.example`: updated comments + remote-backend example
+- Updated README (full rewrite) and CLAUDE.md

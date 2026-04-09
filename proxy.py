@@ -26,40 +26,41 @@ def classify_stderr(stderr_lines: list[str]) -> tuple[int, str, str]:
     return 503, "child_error", "Child process returned an error"
 
 
+def _stderr(pm: ProcessManager | None, n: int = 30) -> list[str]:
+    return pm.get_stderr_tail(n) if pm is not None else []
+
+
 async def proxy_chat_completions(
     request_body: dict,
-    process_manager: ProcessManager,
-    child_port: int,
+    target_url: str,
+    process_manager: ProcessManager | None = None,
 ) -> dict:
-    """Forward a non-streaming /v1/chat/completions request to the child.
+    """Forward a non-streaming /v1/chat/completions request to target_url.
 
     Forces stream=False. Raises OrcError on any failure, with the child's
-    stderr tail included for diagnostics.
+    stderr tail included for diagnostics (empty when process_manager is None).
     """
     request_body = {**request_body, "stream": False}
+    url = f"{target_url}/v1/chat/completions"
 
-    url = f"http://127.0.0.1:{child_port}/v1/chat/completions"
-
-    async with httpx.AsyncClient(
-        timeout=httpx.Timeout(300.0, connect=5.0)
-    ) as client:
+    async with httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=5.0)) as client:
         try:
             resp = await client.post(url, json=request_body)
 
         except httpx.ConnectError:
-            # Child died between ensure_model() and the actual request
-            process_manager._state = ChildState.DYING
-            stderr = process_manager.get_stderr_tail(30)
+            if process_manager is not None:
+                process_manager._state = ChildState.DYING
+            stderr = _stderr(process_manager)
             raise OrcError(503, "Child process is unreachable", error_type="child_unreachable", stderr_tail=stderr)
 
         except httpx.ReadTimeout:
-            stderr = process_manager.get_stderr_tail(30)
+            stderr = _stderr(process_manager)
             raise OrcError(504, "Child process timed out", error_type="child_timeout", stderr_tail=stderr)
 
         except (httpx.RemoteProtocolError, httpx.ReadError) as exc:
-            # Child reset the connection mid-response (crash, OOM, etc.)
-            process_manager._state = ChildState.DYING
-            stderr = process_manager.get_stderr_tail(30)
+            if process_manager is not None:
+                process_manager._state = ChildState.DYING
+            stderr = _stderr(process_manager)
             raise OrcError(
                 503,
                 f"Child process connection error: {exc}",
@@ -67,10 +68,8 @@ async def proxy_chat_completions(
                 stderr_tail=stderr,
             )
 
-    # After receiving a response, verify the child is still alive.
-    # A crash that produces a response before dying shows up here.
-    if not process_manager._is_child_alive():
-        stderr = process_manager.get_stderr_tail(30)
+    if process_manager is not None and not process_manager._is_child_alive():
+        stderr = _stderr(process_manager)
         status, etype, emsg = classify_stderr(stderr)
         process_manager._state = ChildState.DYING
         raise OrcError(status, emsg, error_type=etype, stderr_tail=stderr)
@@ -78,11 +77,9 @@ async def proxy_chat_completions(
     if resp.status_code == 200:
         return resp.json()
 
-    # 4xx / 5xx from the child — classify and surface stderr
-    stderr = process_manager.get_stderr_tail(30)
+    stderr = _stderr(process_manager)
     status, etype, emsg = classify_stderr(stderr)
 
-    # Prefer the child's own error message if it has one
     try:
         child_body = resp.json()
         if isinstance(child_body.get("error"), dict):
@@ -91,7 +88,8 @@ async def proxy_chat_completions(
         pass
 
     log.warning(
-        "Child returned HTTP %d. Classified as %s. Last stderr:\n%s",
+        "Target %s returned HTTP %d. Classified as %s. Last stderr:\n%s",
+        target_url,
         resp.status_code,
         etype,
         "\n".join(stderr),
@@ -101,16 +99,16 @@ async def proxy_chat_completions(
 
 async def proxy_chat_completions_stream(
     request_body: dict,
-    process_manager: ProcessManager,
-    child_port: int,
+    target_url: str,
+    process_manager: ProcessManager | None = None,
 ) -> AsyncGenerator[bytes, None]:
-    """Initiate a streaming /v1/chat/completions request to the child.
+    """Initiate a streaming /v1/chat/completions request to target_url.
 
     Establishes the connection and checks the status code before returning, so
     OrcError can still be raised and caught by FastAPI's exception handler.
     Returns an async generator that yields raw SSE byte chunks.
     """
-    url = f"http://127.0.0.1:{child_port}/v1/chat/completions"
+    url = f"{target_url}/v1/chat/completions"
     client = httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=5.0))
 
     try:
@@ -120,18 +118,19 @@ async def proxy_chat_completions_stream(
         )
     except httpx.ConnectError:
         await client.aclose()
-        process_manager._state = ChildState.DYING
-        stderr = process_manager.get_stderr_tail(30)
+        if process_manager is not None:
+            process_manager._state = ChildState.DYING
+        stderr = _stderr(process_manager)
         raise OrcError(503, "Child process is unreachable", error_type="child_unreachable", stderr_tail=stderr)
     except httpx.ReadTimeout:
         await client.aclose()
-        stderr = process_manager.get_stderr_tail(30)
+        stderr = _stderr(process_manager)
         raise OrcError(504, "Child process timed out", error_type="child_timeout", stderr_tail=stderr)
 
     if response.status_code != 200:
         await response.aread()
         await client.aclose()
-        stderr = process_manager.get_stderr_tail(30)
+        stderr = _stderr(process_manager)
         status, etype, emsg = classify_stderr(stderr)
         try:
             body = response.json()
@@ -139,7 +138,10 @@ async def proxy_chat_completions_stream(
                 emsg = body["error"].get("message", emsg)
         except Exception:
             pass
-        log.warning("Child returned HTTP %d for streaming request. Classified as %s.", response.status_code, etype)
+        log.warning(
+            "Target %s returned HTTP %d for streaming request. Classified as %s.",
+            target_url, response.status_code, etype,
+        )
         raise OrcError(status, emsg, error_type=etype, stderr_tail=stderr)
 
     async def _gen() -> AsyncGenerator[bytes, None]:
@@ -147,7 +149,8 @@ async def proxy_chat_completions_stream(
             async for chunk in response.aiter_bytes():
                 yield chunk
         except (httpx.ReadError, httpx.RemoteProtocolError) as exc:
-            process_manager._state = ChildState.DYING
+            if process_manager is not None:
+                process_manager._state = ChildState.DYING
             log.warning("Streaming connection lost mid-stream: %s", exc)
         finally:
             await response.aclose()
