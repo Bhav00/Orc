@@ -25,33 +25,34 @@ Ollama swallows llama-server errors and returns empty `200` responses. Orc captu
 
 ```
             ┌─────────────────────────┐
-   apps ──▶ │  Orc (FastAPI)          │ ──▶ spawns / kills llama-server.exe
-            │  main.py                │      one at a time
-            └─────────────────────────┘             │
-                       │                            ▼
-                       │                  ┌──────────────────────┐
-                       └─── proxies ────▶ │  llama-server.exe    │
-                                          │  127.0.0.1:CHILD_PORT│
-                                          └──────────────────────┘
+   apps ──▶ │  Orc (FastAPI)          │ ──▶ spawns / kills llama-server.exe (local)
+            │  main.py                │      — OR —
+            └─────────────────────────┘      routes to remote backends (multi-backend)
+                       │
+                       └─── proxies ────▶ llama-server  (local or remote)
 ```
 
-**One model in VRAM at a time.** On model switch, the running child is killed, a post-kill delay allows VRAM to drain, then the new child is spawned.
+**Local mode (default):** One model in VRAM at a time. On model switch, the running child is killed, a post-kill delay allows VRAM to drain, then the new child is spawned.
+
+**Remote-backend mode:** The profile lists one or more external `llama-server` URLs. Orc routes requests to them round-robin. No local process is managed.
 
 ---
 
 ## File layout
 
 ```
-main.py               FastAPI app, routes, lifespan, exception handler
+main.py               FastAPI app, routes, middleware, lifespan, exception handler
 config.py             Env var loading (pydantic-settings)
+metrics.py            MetricsStore — in-process request and spawn counters
 profiles.py           YAML profile loader, Pydantic models, CLI-arg builder
 process_manager.py    Spawn/kill state machine, stderr capture (OrcError lives here)
-proxy.py              HTTP proxy to child, error classification
+proxy.py              HTTP proxy to child or remote backend, error classification
 profiles.yaml         Your model profiles (gitignored — copy from profiles.yaml.example)
-profiles.yaml.example Template with two example Qwen2.5 profiles
+profiles.yaml.example Template with local and remote-backend examples
 .env                  Your env vars (gitignored — copy from .env.example)
 .env.example          All supported env vars with defaults
 requirements.txt      Python dependencies
+logs/                 Rolling log files (created on first run)
 ```
 
 ---
@@ -70,7 +71,7 @@ pip install -r requirements.txt
 cp profiles.yaml.example profiles.yaml
 ```
 
-Edit `profiles.yaml` to point `model_path` at your actual `.gguf` files. The key under `models:` is the model ID used in API requests.
+Edit `profiles.yaml` to point `model_path` at your actual `.gguf` files, or configure `backends` for remote mode. The key under `models:` is the model ID used in API requests.
 
 ### 3. Create your env file
 
@@ -94,20 +95,42 @@ uvicorn main:app --host 127.0.0.1 --port 8080
 
 ---
 
-## Endpoints (Phase 1)
+## Endpoints
 
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/healthz` | Liveness check — always returns `{"status": "ok"}` |
 | GET | `/status` | Current state, loaded model ID, child PID |
-| GET | `/v1/models` | List all profiles from `profiles.yaml` |
-| POST | `/v1/chat/completions` | OpenAI-compatible, non-streaming (Phase 1) |
+| GET | `/v1/models` | List all profiles (`backend_mode`: `"local"` or `"remote"`) |
+| POST | `/v1/chat/completions` | OpenAI-compatible, streaming and non-streaming |
+| GET | `/metrics` | Per-model request counters + process-level spawn/kill stats |
+| POST | `/admin/load` | Pre-load a model into VRAM (requires `X-Admin-Key`) |
+| POST | `/admin/unload` | Unload the running model (requires `X-Admin-Key`) |
+| POST | `/admin/custom_run` | Spawn with flag overrides (requires `X-Admin-Key`) |
 
-Phase 2 will add streaming, idle reaper, and admin endpoints (`/admin/load`, `/admin/unload`). Phase 3 adds `/admin/custom_run`.
+### Session IDs
+
+Every request is tagged with a session ID. Orc reads the `X-Session-ID` request header if present; otherwise it generates a random UUID. The ID is echoed back in the `X-Session-ID` response header and included in every line of `logs/requests.jsonl`.
+
+### Admin endpoints
+
+All `/admin/*` routes require an `X-Admin-Key` header matching `ORCHESTRATOR_ADMIN_KEY`.  
+If `ORCHESTRATOR_ADMIN_KEY` is not set, all admin routes return `503`.
+
+**`POST /admin/load`** — body: `{"model": "<model-id>"}`  
+Pre-loads a local-spawn model. For remote-backend profiles returns immediately.
+
+**`POST /admin/unload`** — no body required  
+Unloads the currently running local model.
+
+**`POST /admin/custom_run`** — body: `{"model": "<model-id>", "flags": {...}}`  
+Kills whatever is running, merges `flags` on top of the profile's flags, and spawns the model with the combined flag set. Useful for quick experiments without editing `profiles.yaml`. Local-spawn profiles only.
 
 ---
 
 ## Profile YAML schema
+
+### Local spawn profile
 
 ```yaml
 models:
@@ -122,13 +145,27 @@ models:
       cache_type_k: q8_0         # → --cache-type-k q8_0
       parallel: 1
       # any llama-server flag works here
-    sampling_defaults:           # documented only — NOT auto-merged in Phase 1
+    sampling_defaults:           # documented only — NOT auto-merged into requests
       temperature: 0.2
       top_p: 0.9
     chat_template: null          # null = auto-detect from GGUF metadata
 ```
 
 Flag-to-CLI-arg rules: `_` → `-`, prepend `--`. `true` emits the flag with no value. `false` omits the flag entirely. `0` is a valid value and is not omitted.
+
+### Remote backend profile
+
+```yaml
+models:
+  <model-id>:
+    display_name: "Human label"
+    backends:
+      - url: "http://10.0.0.1:8090"
+      - url: "http://10.0.0.2:8090"
+    # model_path and flags are ignored in remote mode
+```
+
+Orc picks backends round-robin. No local process is spawned. `model_path` is not required.
 
 ---
 
@@ -150,7 +187,7 @@ All errors use this shape:
 }
 ```
 
-The `stderr_tail` array contains the last lines emitted to `llama-server` stderr before the failure — the primary diagnostic tool.
+The `stderr_tail` array contains the last lines emitted to `llama-server` stderr before the failure — the primary diagnostic tool. For remote-backend profiles, `stderr_tail` is always empty (no local process).
 
 **Classified errors:**
 
@@ -162,6 +199,50 @@ The `stderr_tail` array contains the last lines emitted to `llama-server` stderr
 | Unknown model ID | 404 | `orchestrator_error` |
 | Spawn timeout | 503 | `spawn_timeout` |
 | Port in use | 503 | `port_in_use` |
+
+---
+
+## Logging
+
+On startup, Orc creates the `logs/` directory (configurable via `ORCHESTRATOR_LOG_DIR`) and opens two rolling files:
+
+| File | Contents | Rotation |
+|------|----------|----------|
+| `logs/orc.log` | Full application log at INFO level | Daily, 14-day retention |
+| `logs/requests.jsonl` | One JSON object per `/v1/chat/completions` request | Daily, 14-day retention |
+
+Each line in `requests.jsonl`:
+```json
+{"session_id": "...", "model": "...", "stream": false, "latency_ms": 123.4, "status": 200, "prompt_tokens": 512, "completion_tokens": 64}
+```
+
+For streaming requests, `prompt_tokens` and `completion_tokens` are `0` (headers are committed before the stream completes).
+
+---
+
+## Metrics
+
+`GET /metrics` returns a JSON snapshot of in-process counters. Counters reset on restart.
+
+```json
+{
+  "models": {
+    "qwen2.5-14b-q5": {
+      "requests": 42,
+      "prompt_tokens": 18000,
+      "completion_tokens": 3200,
+      "errors": 1,
+      "avg_latency_ms": 2340.5
+    }
+  },
+  "process": {
+    "spawns": 3,
+    "kills": 2,
+    "current_model": "qwen2.5-14b-q5",
+    "current_model_uptime_s": 180.3
+  }
+}
+```
 
 ---
 
@@ -180,56 +261,17 @@ All variables are prefixed `ORCHESTRATOR_`. Defaults are shown.
 | `VRAM_RESERVE_MB` | `2000` | VRAM headroom to keep free |
 | `SPAWN_TIMEOUT_SECONDS` | `60` | Max wait for child to become healthy |
 | `POST_KILL_DELAY_SECONDS` | `2.0` | Sleep after kill before next spawn |
-| `IDLE_TTL_SECONDS` | `600` | *(Phase 2)* Idle eviction timeout |
-| `ADMIN_KEY` | *(none)* | *(Phase 2)* Required for `/admin/*` routes |
+| `IDLE_TTL_SECONDS` | `600` | Idle eviction timeout (0 = disabled) |
+| `ADMIN_KEY` | *(none)* | Required for `/admin/*` routes |
+| `LOG_DIR` | `logs` | Directory for rolling log files |
 
 ---
 
-## Known limitations (Phase 1)
+## Known limitations
 
-- **Non-streaming only.** `stream: true` requests are silently forced to `stream: false`.
-- **No idle eviction.** The model stays loaded until the next model-switch or server restart.
 - **Sampling defaults not merged.** The `sampling_defaults` block in profiles is informational; clients must send their own sampling parameters.
 - **Profiles loaded once at startup.** Restart the server to pick up `profiles.yaml` changes.
-
----
-
-## Future / next iterations
-
-### Session-scoped logging with rolling log files
-
-Every request should be assigned a `session_id` (or accept one via header, e.g. `X-Session-ID`). All log lines — orchestrator events, proxied request metadata, child stderr lines — should be tagged with that ID so a single session's full trace can be pulled from the log file.
-
-Log files should roll on size and/or date (e.g. `logs/orc-2026-04-08.log`, max 50 MB, keep last 14 days). Python's `logging.handlers.TimedRotatingFileHandler` or `RotatingFileHandler` covers this. The in-memory stderr deque stays as the fast-path for error responses; the log files are the durable audit trail.
-
-Things to log per request: session ID, model ID, request timestamp, prompt token count (from response usage field), completion token count, latency ms, HTTP status returned to client, and any stderr lines emitted during that request.
-
-### Usage metrics
-
-Currently nothing is counted. At minimum the orchestrator should track:
-
-- **Per-model:** total requests, total prompt tokens, total completion tokens, total errors, average latency
-- **Per-session (if session IDs are implemented):** same breakdown scoped to the session
-- **Process-level:** number of spawns, number of kills, total VRAM-load time, model currently loaded + how long it has been loaded
-
-These should be exposed on a `GET /metrics` endpoint — either Prometheus format (for scraping) or a simple JSON summary. No external dependency is required for the JSON path; Prometheus export can use the `prometheus-client` library when needed.
-
-Counters should survive model swaps (i.e. live on the orchestrator, not the child process). They reset on orchestrator restart unless persisted, which is fine for v1.
-
-### Multi-backend / load balancing
-
-The current design assumes a single `llama-server.exe` on a single machine. The next step is to allow the profile registry to list multiple backend URLs instead of always spawning a local process. Each backend is a running `llama-server` instance, possibly on a different machine or port, and Orc acts as a routing layer in front of them.
-
-Proposed profile extension:
-```yaml
-models:
-  qwen2.5-14b-q5:
-    backends:
-      - url: "http://10.0.0.1:8090"
-      - url: "http://10.0.0.2:8090"
-    # ... rest of profile unchanged
-```
-
-When multiple backends are listed for a model, Orc load-balances across them (round-robin or least-connections). For Phase 1 compatibility, a profile with no `backends` key falls back to the current local-spawn behaviour.
-
-**Same models on all endpoints:** for now the assumption is that every backend listed under a model profile actually has that model loaded or can load it. A model availability checker (health + model-list probe against each backend) is already planned as a separate pipeline component and will feed into backend selection here. Backends that fail the health check are removed from rotation until they recover.
+- **Streaming mid-stream errors.** If the child dies after the first SSE chunk is sent, the client receives an incomplete stream (HTTP headers are already committed). Pre-stream errors (connection failure, non-200 status) are still surfaced as structured JSON.
+- **Streaming token counts not logged.** `prompt_tokens`/`completion_tokens` are `0` in `requests.jsonl` for streaming requests.
+- **No backend health checking.** For remote-backend profiles, unhealthy backends stay in the round-robin rotation until they respond. A failed request to a backend returns an error to the client.
+- **Metrics not persisted.** In-process counters reset on restart.

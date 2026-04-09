@@ -2,12 +2,14 @@ import asyncio
 import enum
 import logging
 import socket
+import time
 from collections import deque
 from dataclasses import dataclass, field
 
 import httpx
 
 from config import Settings
+from metrics import MetricsStore
 from profiles import ModelProfile, ProfilesFile, build_cli_args
 
 log = logging.getLogger("orc.process_manager")
@@ -55,9 +57,15 @@ class ProcessManager:
         self._child: ChildInfo | None = None
         self._lock: asyncio.Lock = asyncio.Lock()
         self._profiles: ProfilesFile | None = None
+        self._last_used_at: float | None = None
+        self._reaper_task: asyncio.Task | None = None
+        self._metrics: MetricsStore | None = None
 
     def set_profiles(self, profiles: ProfilesFile) -> None:
         self._profiles = profiles
+
+    def set_metrics(self, metrics: MetricsStore) -> None:
+        self._metrics = metrics
 
     # ------------------------------------------------------------------
     # Public interface
@@ -74,6 +82,7 @@ class ProcessManager:
             and self._child.model_id == model_id
             and self._is_child_alive()
         ):
+            self._last_used_at = time.monotonic()
             return
 
         async with self._lock:
@@ -84,6 +93,7 @@ class ProcessManager:
                 and self._child.model_id == model_id
                 and self._is_child_alive()
             ):
+                self._last_used_at = time.monotonic()
                 return
 
             # Kill whatever is currently running (any non-IDLE state)
@@ -107,12 +117,54 @@ class ProcessManager:
                 )
 
             await self._spawn(model_id, profile)
+            self._last_used_at = time.monotonic()
 
     async def kill_current(self) -> None:
         """Force-unload the current model. Safe to call when already IDLE."""
         async with self._lock:
             if self._state != ChildState.IDLE:
                 await self._kill_and_wait()
+
+    async def custom_run(self, model_id: str, flag_overrides: dict) -> None:
+        """Spawn a model with per-request flag overrides merged on top of its profile.
+
+        Always kills the current model first (even if it is the same model_id),
+        because the flags may differ from what is currently running.
+        Requires X-Admin-Key auth (enforced by the caller).
+        """
+        async with self._lock:
+            if self._state != ChildState.IDLE:
+                await self._kill_and_wait()
+
+            assert self._profiles is not None
+            profile = self._profiles.models.get(model_id)
+            if profile is None:
+                raise OrcError(404, f"Unknown model: {model_id!r}. Check profiles.yaml.")
+
+            if profile.backends:
+                raise OrcError(
+                    400,
+                    f"Model {model_id!r} uses remote backends — custom_run is for local spawns only.",
+                    error_type="unsupported_operation",
+                )
+
+            merged_flags = {**profile.flags, **flag_overrides}
+            custom_profile = profile.model_copy(update={"flags": merged_flags})
+
+            await self._spawn(model_id, custom_profile)
+            self._last_used_at = time.monotonic()
+
+    def start_idle_reaper(self) -> None:
+        """Start the background task that evicts idle models. No-op if TTL is 0."""
+        if self._settings.idle_ttl_seconds > 0:
+            self._reaper_task = asyncio.create_task(
+                self._idle_reaper_loop(), name="idle-reaper"
+            )
+
+    def stop_idle_reaper(self) -> None:
+        """Cancel the idle reaper task."""
+        if self._reaper_task and not self._reaper_task.done():
+            self._reaper_task.cancel()
 
     def get_status(self) -> dict:
         return {
@@ -187,6 +239,8 @@ class ProcessManager:
 
         self._state = ChildState.READY
         log.info("Model %r is ready (pid=%d)", model_id, process.pid)
+        if self._metrics is not None:
+            self._metrics.record_spawn(model_id)
 
     async def _kill_and_wait(self) -> None:
         """Terminate the child process and wait for it to exit, then sleep
@@ -220,6 +274,8 @@ class ProcessManager:
                 pass
 
         self._child = None
+        if self._metrics is not None:
+            self._metrics.record_kill()
 
         log.debug("Waiting %.1fs for VRAM release", self._settings.post_kill_delay_seconds)
         await asyncio.sleep(self._settings.post_kill_delay_seconds)
@@ -261,6 +317,23 @@ class ProcessManager:
             raise
         except Exception as exc:
             log.warning("Stderr reader exited unexpectedly: %s", exc)
+
+    async def _idle_reaper_loop(self) -> None:
+        """Background task: evict the loaded model after IDLE_TTL_SECONDS of inactivity."""
+        while True:
+            await asyncio.sleep(30)
+            if (
+                self._state == ChildState.READY
+                and self._last_used_at is not None
+                and (time.monotonic() - self._last_used_at) > self._settings.idle_ttl_seconds
+            ):
+                model_id = self._child.model_id if self._child else "unknown"
+                log.info(
+                    "Model %r idle for >%ds — unloading",
+                    model_id,
+                    self._settings.idle_ttl_seconds,
+                )
+                await self.kill_current()
 
     def _is_child_alive(self) -> bool:
         return self._child is not None and self._child.process.returncode is None
