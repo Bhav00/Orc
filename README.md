@@ -67,7 +67,11 @@ pip install -r requirements.txt
 
 ### 2. Create your profiles file
 
-```
+```bash
+# Windows
+copy profiles.yaml.example profiles.yaml
+
+# Linux / macOS
 cp profiles.yaml.example profiles.yaml
 ```
 
@@ -75,7 +79,11 @@ Edit `profiles.yaml` to point `model_path` at your actual `.gguf` files, or conf
 
 ### 3. Create your env file
 
-```
+```bash
+# Windows
+copy .env.example .env
+
+# Linux / macOS
 cp .env.example .env
 ```
 
@@ -189,16 +197,27 @@ All errors use this shape:
 
 The `stderr_tail` array contains the last lines emitted to `llama-server` stderr before the failure — the primary diagnostic tool. For remote-backend profiles, `stderr_tail` is always empty (no local process).
 
-**Classified errors:**
+**Stderr-classified errors** (pattern detected in child's stderr output):
 
 | Pattern in stderr | HTTP status | type |
 |-------------------|-------------|------|
 | "context window" / "kv cache is full" | 400 | `context_length_exceeded` |
 | "out of memory" / OOM | 503 | `out_of_memory` |
 | "cuda error" | 503 | `cuda_error` |
-| Unknown model ID | 404 | `orchestrator_error` |
-| Spawn timeout | 503 | `spawn_timeout` |
-| Port in use | 503 | `port_in_use` |
+| *(no pattern matched)* | 503 | `child_error` |
+
+**Orchestrator and proxy errors** (raised before or outside stderr classification):
+
+| Condition | HTTP status | type |
+|-----------|-------------|------|
+| Unknown model ID in request | 404 | `orchestrator_error` |
+| Model VRAM exceeds available headroom | 503 | `insufficient_vram` |
+| Spawn health-check timeout | 503 | `spawn_timeout` |
+| Child port already in use | 503 | `port_in_use` |
+| Child process unreachable (ConnectError) | 503 | `child_unreachable` |
+| Child process timed out (ReadTimeout) | 504 | `child_timeout` |
+| Child connection lost mid-request | 503 | `child_connection_error` |
+| `custom_run` on a remote-backend profile | 400 | `unsupported_operation` |
 
 ---
 

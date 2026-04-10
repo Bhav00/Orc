@@ -132,7 +132,7 @@ All prefixed `ORCHESTRATOR_`. See `.env.example` for full list.
 
 ## Development branch
 
-`claude/complete-readme-phases-zR4aB`
+`claude/review-docs-improvements-vNmMT`
 
 ---
 
@@ -162,3 +162,10 @@ All prefixed `ORCHESTRATOR_`. See `.env.example` for full list.
 - `.env.example`: added `ORCHESTRATOR_LOG_DIR`
 - `profiles.yaml.example`: updated comments + remote-backend example
 - Updated README (full rewrite) and CLAUDE.md
+
+### 2026-04-10 (session 4)
+- Full audit of README.md and CLAUDE.md against all 6 source files — verified endpoints, env vars, invariants, error format, metrics output, logging, and known limitations all accurate
+- Fixed stale development branch reference in CLAUDE.md (`claude/complete-readme-phases-zR4aB` → `claude/review-docs-improvements-vNmMT`)
+- Fixed README.md setup section: added Windows `copy` commands alongside Unix `cp`
+- Expanded README.md error classification table: split into "Stderr-classified errors" and "Orchestrator/proxy errors", added 6 missing error types (`child_unreachable`, `child_timeout`, `child_connection_error`, `child_error`, `insufficient_vram`, `unsupported_operation`)
+- Catalogued 15 future improvement suggestions across 3 effort tiers (see plan file)
