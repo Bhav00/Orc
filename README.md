@@ -111,9 +111,11 @@ uvicorn main:app --host 127.0.0.1 --port 8080
 | GET | `/status` | Current state, loaded model ID, child PID |
 | GET | `/v1/models` | List all profiles (`backend_mode`: `"local"` or `"remote"`) |
 | POST | `/v1/chat/completions` | OpenAI-compatible, streaming and non-streaming |
-| GET | `/metrics` | Per-model request counters + process-level spawn/kill stats |
+| GET | `/metrics` | Per-model request counters + process-level spawn/kill stats (JSON) |
+| GET | `/metrics/prometheus` | Same counters in Prometheus exposition format |
 | POST | `/admin/load` | Pre-load a model into VRAM (requires `X-Admin-Key`) |
 | POST | `/admin/unload` | Unload the running model (requires `X-Admin-Key`) |
+| POST | `/admin/reload-profiles` | Re-read `profiles.yaml` from disk (requires `X-Admin-Key`) |
 | POST | `/admin/custom_run` | Spawn with flag overrides (requires `X-Admin-Key`) |
 
 ### Session IDs
@@ -130,6 +132,9 @@ Pre-loads a local-spawn model. For remote-backend profiles returns immediately.
 
 **`POST /admin/unload`** — no body required  
 Unloads the currently running local model.
+
+**`POST /admin/reload-profiles`** — no body required  
+Re-reads `profiles.yaml` from disk and swaps the live profile set. The currently loaded model (if any) keeps running with its original flags; new profiles take effect on the next model switch or `admin/load` call.
 
 **`POST /admin/custom_run`** — body: `{"model": "<model-id>", "flags": {...}}`  
 Kills whatever is running, merges `flags` on top of the profile's flags, and spawns the model with the combined flag set. Useful for quick experiments without editing `profiles.yaml`. Local-spawn profiles only.
@@ -153,7 +158,7 @@ models:
       cache_type_k: q8_0         # → --cache-type-k q8_0
       parallel: 1
       # any llama-server flag works here
-    sampling_defaults:           # documented only — NOT auto-merged into requests
+    sampling_defaults:           # auto-merged into requests (client params take precedence)
       temperature: 0.2
       top_p: 0.9
     chat_template: null          # null = auto-detect from GGUF metadata
@@ -282,14 +287,14 @@ All variables are prefixed `ORCHESTRATOR_`. Defaults are shown.
 | `POST_KILL_DELAY_SECONDS` | `2.0` | Sleep after kill before next spawn |
 | `IDLE_TTL_SECONDS` | `600` | Idle eviction timeout (0 = disabled) |
 | `ADMIN_KEY` | *(none)* | Required for `/admin/*` routes |
+| `CORS_ORIGINS` | *(empty)* | Comma-separated allowed origins, or `*` for all; empty = disabled |
+| `PRELOAD_MODEL` | *(empty)* | Model ID to pre-load into VRAM on startup; empty = no preload |
 | `LOG_DIR` | `logs` | Directory for rolling log files |
 
 ---
 
 ## Known limitations
 
-- **Sampling defaults not merged.** The `sampling_defaults` block in profiles is informational; clients must send their own sampling parameters.
-- **Profiles loaded once at startup.** Restart the server to pick up `profiles.yaml` changes.
 - **Streaming mid-stream errors.** If the child dies after the first SSE chunk is sent, the client receives an incomplete stream (HTTP headers are already committed). Pre-stream errors (connection failure, non-200 status) are still surfaced as structured JSON.
 - **Streaming token counts not logged.** `prompt_tokens`/`completion_tokens` are `0` in `requests.jsonl` for streaming requests.
 - **No backend health checking.** For remote-backend profiles, unhealthy backends stay in the round-robin rotation until they respond. A failed request to a backend returns an error to the client.

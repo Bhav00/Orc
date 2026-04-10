@@ -61,6 +61,52 @@ class MetricsStore:
 
     # --- serialisation ---
 
+    def to_prometheus(self) -> str:
+        """Render counters in Prometheus exposition format (text/plain)."""
+        lines: list[str] = []
+
+        lines.append("# HELP orc_model_requests_total Total requests per model.")
+        lines.append("# TYPE orc_model_requests_total counter")
+        for mid, m in self._models.items():
+            lines.append(f'orc_model_requests_total{{model="{mid}"}} {m.requests}')
+
+        lines.append("# HELP orc_model_prompt_tokens_total Total prompt tokens per model.")
+        lines.append("# TYPE orc_model_prompt_tokens_total counter")
+        for mid, m in self._models.items():
+            lines.append(f'orc_model_prompt_tokens_total{{model="{mid}"}} {m.prompt_tokens}')
+
+        lines.append("# HELP orc_model_completion_tokens_total Total completion tokens per model.")
+        lines.append("# TYPE orc_model_completion_tokens_total counter")
+        for mid, m in self._models.items():
+            lines.append(f'orc_model_completion_tokens_total{{model="{mid}"}} {m.completion_tokens}')
+
+        lines.append("# HELP orc_model_errors_total Total errors per model.")
+        lines.append("# TYPE orc_model_errors_total counter")
+        for mid, m in self._models.items():
+            lines.append(f'orc_model_errors_total{{model="{mid}"}} {m.errors}')
+
+        lines.append("# HELP orc_model_avg_latency_ms Average request latency per model.")
+        lines.append("# TYPE orc_model_avg_latency_ms gauge")
+        for mid, m in self._models.items():
+            lines.append(f'orc_model_avg_latency_ms{{model="{mid}"}} {m.avg_latency_ms}')
+
+        lines.append("# HELP orc_process_spawns_total Total model spawns.")
+        lines.append("# TYPE orc_process_spawns_total counter")
+        lines.append(f"orc_process_spawns_total {self._spawns}")
+
+        lines.append("# HELP orc_process_kills_total Total model kills.")
+        lines.append("# TYPE orc_process_kills_total counter")
+        lines.append(f"orc_process_kills_total {self._kills}")
+
+        if self._current_model_loaded_at is not None:
+            uptime = round(time.monotonic() - self._current_model_loaded_at, 1)
+            lines.append("# HELP orc_current_model_uptime_seconds Uptime of the current model.")
+            lines.append("# TYPE orc_current_model_uptime_seconds gauge")
+            lines.append(f"orc_current_model_uptime_seconds {uptime}")
+
+        lines.append("")  # trailing newline
+        return "\n".join(lines)
+
     def to_dict(self) -> dict:
         uptime = (
             round(time.monotonic() - self._current_model_loaded_at, 1)

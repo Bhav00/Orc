@@ -8,7 +8,8 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 from pydantic import BaseModel
 from starlette.middleware.base import BaseHTTPMiddleware
 
@@ -135,6 +136,14 @@ async def lifespan(app: FastAPI):
     app.state.metrics = metrics
     app.state.backend_router = BackendRouter()
 
+    if settings.preload_model:
+        model_id = settings.preload_model
+        if model_id in profiles.models:
+            log.info("Preloading model %r on startup", model_id)
+            await pm.ensure_model(model_id)
+        else:
+            log.warning("PRELOAD_MODEL=%r not found in profiles — skipping preload", model_id)
+
     yield
 
     log.info("Shutting down — unloading any running model")
@@ -146,8 +155,17 @@ async def lifespan(app: FastAPI):
 # App
 # ---------------------------------------------------------------------------
 
-app = FastAPI(title="Orc", version="0.3.0", lifespan=lifespan)
+app = FastAPI(title="Orc", version="0.4.0", lifespan=lifespan)
 app.add_middleware(SessionMiddleware)
+
+if settings.cors_origins:
+    origins = [o.strip() for o in settings.cors_origins.split(",")]
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=origins,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -243,6 +261,11 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
 
         body_dict = body.model_dump()
 
+        # Merge profile sampling defaults (client-supplied params take precedence)
+        if profile.sampling_defaults:
+            for key, value in profile.sampling_defaults.items():
+                body_dict.setdefault(key, value)
+
         if body.stream:
             gen = await proxy_chat_completions_stream(
                 request_body=body_dict,
@@ -296,6 +319,13 @@ async def get_metrics(request: Request) -> dict:
     return metrics.to_dict()
 
 
+@app.get("/metrics/prometheus")
+async def get_metrics_prometheus(request: Request) -> PlainTextResponse:
+    """Metrics in Prometheus exposition format (text/plain)."""
+    metrics: MetricsStore = request.app.state.metrics
+    return PlainTextResponse(metrics.to_prometheus(), media_type="text/plain; version=0.0.4")
+
+
 # ---------------------------------------------------------------------------
 # Admin endpoints
 # ---------------------------------------------------------------------------
@@ -331,6 +361,25 @@ async def admin_unload(
     pm: ProcessManager = request.app.state.process_manager
     await pm.kill_current()
     return {"status": "ok"}
+
+
+@app.post("/admin/reload-profiles")
+async def admin_reload_profiles(
+    request: Request,
+    _: None = Depends(require_admin),
+) -> dict:
+    """Re-read profiles.yaml from disk and swap the live profile set.
+
+    The currently loaded model (if any) keeps running with its original flags.
+    New profiles take effect on the next model switch or admin/load call.
+    Requires X-Admin-Key header.
+    """
+    profiles = load_profiles(settings.profiles_path)
+    pm: ProcessManager = request.app.state.process_manager
+    pm.set_profiles(profiles)
+    request.app.state.profiles = profiles
+    log.info("Reloaded %d profile(s): %s", len(profiles.models), list(profiles.models.keys()))
+    return {"status": "ok", "profiles": list(profiles.models.keys())}
 
 
 @app.post("/admin/custom_run")

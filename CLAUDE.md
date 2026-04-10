@@ -36,6 +36,13 @@ Target: Windows, single NVIDIA GPU, llama.cpp prebuilt CUDA binaries.
 - Usage metrics — `MetricsStore` (`metrics.py`); per-model request/token/error/latency counters; process-level spawn/kill counts; `GET /metrics` endpoint
 - Multi-backend routing — `backends: [{url: ...}]` in profile skips local spawn and routes to remote URLs round-robin via `BackendRouter`; `proxy.py` refactored to take `target_url: str` and optional `ProcessManager`
 
+**Implemented (Phase 4 — quality-of-life):**
+- Profile hot-reload — `POST /admin/reload-profiles` re-reads `profiles.yaml` from disk; running model keeps its flags until next switch
+- Sampling defaults auto-merge — profile `sampling_defaults` are merged into each request body; client-supplied params take precedence via `setdefault`
+- CORS middleware — optional `ORCHESTRATOR_CORS_ORIGINS` env var; when set, adds `CORSMiddleware` with specified origins
+- Startup preloading — `ORCHESTRATOR_PRELOAD_MODEL` env var; when set, `ensure_model()` is called during lifespan startup
+- Prometheus metrics — `GET /metrics/prometheus` returns counters in Prometheus exposition format; `MetricsStore.to_prometheus()` renders text/plain output
+
 ---
 
 ## File map
@@ -100,6 +107,8 @@ All prefixed `ORCHESTRATOR_`. See `.env.example` for full list.
 - `VRAM_TOTAL_MB` / `VRAM_RESERVE_MB` — sanity check limits
 - `IDLE_TTL_SECONDS` — idle eviction timeout; 0 = disabled (default 600)
 - `ADMIN_KEY` — required for `/admin/*` routes
+- `CORS_ORIGINS` — comma-separated allowed origins, or `*`; empty = disabled
+- `PRELOAD_MODEL` — model ID to pre-load on startup; empty = no preload
 - `LOG_DIR` — directory for rolling log files (default `logs`)
 
 ---
@@ -111,10 +120,12 @@ All prefixed `ORCHESTRATOR_`. See `.env.example` for full list.
 | GET | `/healthz` | Always `{"status": "ok"}` |
 | GET | `/status` | State machine status + PID |
 | GET | `/v1/models` | Lists profiles from YAML; includes `backend_mode` field |
-| POST | `/v1/chat/completions` | Streaming and non-streaming |
+| POST | `/v1/chat/completions` | Streaming and non-streaming; merges profile `sampling_defaults` |
 | GET | `/metrics` | Per-model + process-level counters (JSON) |
+| GET | `/metrics/prometheus` | Same counters in Prometheus exposition format |
 | POST | `/admin/load` | Pre-load model; requires `X-Admin-Key` |
 | POST | `/admin/unload` | Unload model; requires `X-Admin-Key` |
+| POST | `/admin/reload-profiles` | Re-read `profiles.yaml` from disk; requires `X-Admin-Key` |
 | POST | `/admin/custom_run` | Spawn with flag overrides; requires `X-Admin-Key` |
 
 ---
@@ -168,4 +179,14 @@ All prefixed `ORCHESTRATOR_`. See `.env.example` for full list.
 - Fixed stale development branch reference in CLAUDE.md (`claude/complete-readme-phases-zR4aB` → `claude/review-docs-improvements-vNmMT`)
 - Fixed README.md setup section: added Windows `copy` commands alongside Unix `cp`
 - Expanded README.md error classification table: split into "Stderr-classified errors" and "Orchestrator/proxy errors", added 6 missing error types (`child_unreachable`, `child_timeout`, `child_connection_error`, `child_error`, `insufficient_vram`, `unsupported_operation`)
-- Catalogued 15 future improvement suggestions across 3 effort tiers (see plan file)
+- Implemented 5 quality-of-life improvements (Phase 4):
+  - `POST /admin/reload-profiles` — hot-reload profiles.yaml without restart
+  - Sampling defaults auto-merge — profile `sampling_defaults` injected into requests (client overrides)
+  - CORS middleware — `ORCHESTRATOR_CORS_ORIGINS` env var enables browser-based clients
+  - Startup preloading — `ORCHESTRATOR_PRELOAD_MODEL` env var warms model on boot
+  - `GET /metrics/prometheus` — Prometheus exposition format endpoint
+- `config.py`: added `cors_origins` and `preload_model` settings
+- `metrics.py`: added `to_prometheus()` method
+- `.env.example`: added `ORCHESTRATOR_CORS_ORIGINS` and `ORCHESTRATOR_PRELOAD_MODEL`
+- Version bumped to 0.4.0
+- Updated README and CLAUDE.md: new endpoints, env vars, removed resolved known limitations
