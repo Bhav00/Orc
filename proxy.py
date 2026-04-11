@@ -1,5 +1,6 @@
+import json
 import logging
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Callable
 
 import httpx
 
@@ -34,14 +35,15 @@ async def proxy_chat_completions(
     request_body: dict,
     target_url: str,
     process_manager: ProcessManager | None = None,
+    endpoint_path: str = "/v1/chat/completions",
 ) -> dict:
-    """Forward a non-streaming /v1/chat/completions request to target_url.
+    """Forward a non-streaming request to target_url.
 
     Forces stream=False. Raises OrcError on any failure, with the child's
     stderr tail included for diagnostics (empty when process_manager is None).
     """
     request_body = {**request_body, "stream": False}
-    url = f"{target_url}/v1/chat/completions"
+    url = f"{target_url}{endpoint_path}"
 
     async with httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=5.0)) as client:
         try:
@@ -101,14 +103,20 @@ async def proxy_chat_completions_stream(
     request_body: dict,
     target_url: str,
     process_manager: ProcessManager | None = None,
+    endpoint_path: str = "/v1/chat/completions",
+    on_finish: Callable[[int, int], None] | None = None,
 ) -> AsyncGenerator[bytes, None]:
-    """Initiate a streaming /v1/chat/completions request to target_url.
+    """Initiate a streaming request to target_url.
 
     Establishes the connection and checks the status code before returning, so
     OrcError can still be raised and caught by FastAPI's exception handler.
     Returns an async generator that yields raw SSE byte chunks.
+
+    If *on_finish* is provided, it is called with (prompt_tokens, completion_tokens)
+    after the stream is fully consumed.  Token counts are extracted from the last
+    SSE ``data:`` line (llama-server includes ``usage`` in the final chunk).
     """
-    url = f"{target_url}/v1/chat/completions"
+    url = f"{target_url}{endpoint_path}"
     client = httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=5.0))
 
     try:
@@ -145,9 +153,17 @@ async def proxy_chat_completions_stream(
         raise OrcError(status, emsg, error_type=etype, stderr_tail=stderr)
 
     async def _gen() -> AsyncGenerator[bytes, None]:
+        last_data_line = ""
         try:
             async for chunk in response.aiter_bytes():
                 yield chunk
+                # Track the last SSE data line for usage extraction
+                if on_finish is not None:
+                    text = chunk.decode("utf-8", errors="replace")
+                    for line in text.split("\n"):
+                        stripped = line.strip()
+                        if stripped.startswith("data: ") and stripped != "data: [DONE]":
+                            last_data_line = stripped[6:]
         except (httpx.ReadError, httpx.RemoteProtocolError) as exc:
             if process_manager is not None:
                 process_manager._state = ChildState.DYING
@@ -155,5 +171,16 @@ async def proxy_chat_completions_stream(
         finally:
             await response.aclose()
             await client.aclose()
+            if on_finish is not None:
+                prompt_tokens = completion_tokens = 0
+                if last_data_line:
+                    try:
+                        parsed = json.loads(last_data_line)
+                        usage = parsed.get("usage") or {}
+                        prompt_tokens = usage.get("prompt_tokens", 0)
+                        completion_tokens = usage.get("completion_tokens", 0)
+                    except (json.JSONDecodeError, KeyError, TypeError):
+                        pass
+                on_finish(prompt_tokens, completion_tokens)
 
     return _gen()

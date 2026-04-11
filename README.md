@@ -52,6 +52,7 @@ profiles.yaml.example Template with local and remote-backend examples
 .env                  Your env vars (gitignored — copy from .env.example)
 .env.example          All supported env vars with defaults
 requirements.txt      Python dependencies
+tests/                Test suite (pytest + respx)
 logs/                 Rolling log files (created on first run)
 ```
 
@@ -67,7 +68,11 @@ pip install -r requirements.txt
 
 ### 2. Create your profiles file
 
-```
+```bash
+# Windows
+copy profiles.yaml.example profiles.yaml
+
+# Linux / macOS
 cp profiles.yaml.example profiles.yaml
 ```
 
@@ -75,7 +80,11 @@ Edit `profiles.yaml` to point `model_path` at your actual `.gguf` files, or conf
 
 ### 3. Create your env file
 
-```
+```bash
+# Windows
+copy .env.example .env
+
+# Linux / macOS
 cp .env.example .env
 ```
 
@@ -103,9 +112,12 @@ uvicorn main:app --host 127.0.0.1 --port 8080
 | GET | `/status` | Current state, loaded model ID, child PID |
 | GET | `/v1/models` | List all profiles (`backend_mode`: `"local"` or `"remote"`) |
 | POST | `/v1/chat/completions` | OpenAI-compatible, streaming and non-streaming |
-| GET | `/metrics` | Per-model request counters + process-level spawn/kill stats |
+| POST | `/v1/completions` | OpenAI-compatible text completions (prompt-based) |
+| GET | `/metrics` | Per-model request counters + process-level spawn/kill stats (JSON) |
+| GET | `/metrics/prometheus` | Same counters in Prometheus exposition format |
 | POST | `/admin/load` | Pre-load a model into VRAM (requires `X-Admin-Key`) |
 | POST | `/admin/unload` | Unload the running model (requires `X-Admin-Key`) |
+| POST | `/admin/reload-profiles` | Re-read `profiles.yaml` from disk (requires `X-Admin-Key`) |
 | POST | `/admin/custom_run` | Spawn with flag overrides (requires `X-Admin-Key`) |
 
 ### Session IDs
@@ -122,6 +134,9 @@ Pre-loads a local-spawn model. For remote-backend profiles returns immediately.
 
 **`POST /admin/unload`** — no body required  
 Unloads the currently running local model.
+
+**`POST /admin/reload-profiles`** — no body required  
+Re-reads `profiles.yaml` from disk and swaps the live profile set. The currently loaded model (if any) keeps running with its original flags; new profiles take effect on the next model switch or `admin/load` call.
 
 **`POST /admin/custom_run`** — body: `{"model": "<model-id>", "flags": {...}}`  
 Kills whatever is running, merges `flags` on top of the profile's flags, and spawns the model with the combined flag set. Useful for quick experiments without editing `profiles.yaml`. Local-spawn profiles only.
@@ -145,7 +160,7 @@ models:
       cache_type_k: q8_0         # → --cache-type-k q8_0
       parallel: 1
       # any llama-server flag works here
-    sampling_defaults:           # documented only — NOT auto-merged into requests
+    sampling_defaults:           # auto-merged into requests (client params take precedence)
       temperature: 0.2
       top_p: 0.9
     chat_template: null          # null = auto-detect from GGUF metadata
@@ -189,16 +204,27 @@ All errors use this shape:
 
 The `stderr_tail` array contains the last lines emitted to `llama-server` stderr before the failure — the primary diagnostic tool. For remote-backend profiles, `stderr_tail` is always empty (no local process).
 
-**Classified errors:**
+**Stderr-classified errors** (pattern detected in child's stderr output):
 
 | Pattern in stderr | HTTP status | type |
 |-------------------|-------------|------|
 | "context window" / "kv cache is full" | 400 | `context_length_exceeded` |
 | "out of memory" / OOM | 503 | `out_of_memory` |
 | "cuda error" | 503 | `cuda_error` |
-| Unknown model ID | 404 | `orchestrator_error` |
-| Spawn timeout | 503 | `spawn_timeout` |
-| Port in use | 503 | `port_in_use` |
+| *(no pattern matched)* | 503 | `child_error` |
+
+**Orchestrator and proxy errors** (raised before or outside stderr classification):
+
+| Condition | HTTP status | type |
+|-----------|-------------|------|
+| Unknown model ID in request | 404 | `orchestrator_error` |
+| Model VRAM exceeds available headroom | 503 | `insufficient_vram` |
+| Spawn health-check timeout | 503 | `spawn_timeout` |
+| Child port already in use | 503 | `port_in_use` |
+| Child process unreachable (ConnectError) | 503 | `child_unreachable` |
+| Child process timed out (ReadTimeout) | 504 | `child_timeout` |
+| Child connection lost mid-request | 503 | `child_connection_error` |
+| `custom_run` on a remote-backend profile | 400 | `unsupported_operation` |
 
 ---
 
@@ -216,7 +242,7 @@ Each line in `requests.jsonl`:
 {"session_id": "...", "model": "...", "stream": false, "latency_ms": 123.4, "status": 200, "prompt_tokens": 512, "completion_tokens": 64}
 ```
 
-For streaming requests, `prompt_tokens` and `completion_tokens` are `0` (headers are committed before the stream completes).
+For streaming requests, token counts are extracted from the final SSE `data:` chunk (llama-server includes `usage` there). If the stream ends without usage data, both counts default to `0`.
 
 ---
 
@@ -263,15 +289,39 @@ All variables are prefixed `ORCHESTRATOR_`. Defaults are shown.
 | `POST_KILL_DELAY_SECONDS` | `2.0` | Sleep after kill before next spawn |
 | `IDLE_TTL_SECONDS` | `600` | Idle eviction timeout (0 = disabled) |
 | `ADMIN_KEY` | *(none)* | Required for `/admin/*` routes |
+| `CORS_ORIGINS` | *(empty)* | Comma-separated allowed origins, or `*` for all; empty = disabled |
+| `PRELOAD_MODEL` | *(empty)* | Model ID to pre-load into VRAM on startup; empty = no preload |
+| `BACKEND_HEALTH_INTERVAL` | `30` | Health poll interval for remote backends in seconds (0 = disabled) |
 | `LOG_DIR` | `logs` | Directory for rolling log files |
 
 ---
 
 ## Known limitations
 
-- **Sampling defaults not merged.** The `sampling_defaults` block in profiles is informational; clients must send their own sampling parameters.
-- **Profiles loaded once at startup.** Restart the server to pick up `profiles.yaml` changes.
 - **Streaming mid-stream errors.** If the child dies after the first SSE chunk is sent, the client receives an incomplete stream (HTTP headers are already committed). Pre-stream errors (connection failure, non-200 status) are still surfaced as structured JSON.
-- **Streaming token counts not logged.** `prompt_tokens`/`completion_tokens` are `0` in `requests.jsonl` for streaming requests.
-- **No backend health checking.** For remote-backend profiles, unhealthy backends stay in the round-robin rotation until they respond. A failed request to a backend returns an error to the client.
 - **Metrics not persisted.** In-process counters reset on restart.
+
+---
+
+## Testing
+
+```
+pip install -r requirements.txt
+pytest -v
+```
+
+The test suite uses `pytest` with `pytest-asyncio` for async tests and `respx` for mocking `httpx` calls. Tests cover:
+
+- **Profile loading** — `build_cli_args` flag conversion, model validation, YAML parsing
+- **Proxy layer** — stderr classification, non-streaming/streaming error handling, endpoint path routing
+- **Metrics** — per-model counters, spawn/kill tracking, Prometheus export
+- **Backend router** — round-robin, trailing-slash normalization, health filtering, fallback when all unhealthy
+- **Sampling defaults** — merge logic, client-override precedence
+
+---
+
+## Future plans
+
+- **Request queuing during model swap** — configurable timeout + `Retry-After` header for requests blocked on the spawn lock instead of hanging indefinitely; optional queue depth limit to reject excess requests early
+- **Multi-model on one GPU** — load multiple small models concurrently when VRAM allows
+- **Persistent metrics** — survive restarts via SQLite or flat file

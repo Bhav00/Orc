@@ -36,6 +36,19 @@ Target: Windows, single NVIDIA GPU, llama.cpp prebuilt CUDA binaries.
 - Usage metrics — `MetricsStore` (`metrics.py`); per-model request/token/error/latency counters; process-level spawn/kill counts; `GET /metrics` endpoint
 - Multi-backend routing — `backends: [{url: ...}]` in profile skips local spawn and routes to remote URLs round-robin via `BackendRouter`; `proxy.py` refactored to take `target_url: str` and optional `ProcessManager`
 
+**Implemented (Phase 4 — quality-of-life):**
+- Profile hot-reload — `POST /admin/reload-profiles` re-reads `profiles.yaml` from disk; running model keeps its flags until next switch
+- Sampling defaults auto-merge — profile `sampling_defaults` are merged into each request body; client-supplied params take precedence via `setdefault`
+- CORS middleware — optional `ORCHESTRATOR_CORS_ORIGINS` env var; when set, adds `CORSMiddleware` with specified origins
+- Startup preloading — `ORCHESTRATOR_PRELOAD_MODEL` env var; when set, `ensure_model()` is called during lifespan startup
+- Prometheus metrics — `GET /metrics/prometheus` returns counters in Prometheus exposition format; `MetricsStore.to_prometheus()` renders text/plain output
+
+**Implemented (Phase 5 — medium improvements):**
+- Test suite (`tests/`) — pytest + pytest-asyncio + respx; 56 tests covering profiles, proxy, metrics, backend router, sampling defaults
+- Streaming token extraction — `on_finish` callback in `proxy_chat_completions_stream()` parses final SSE `data:` chunk for `usage`; metrics and request log now capture token counts for streaming requests
+- `/v1/completions` endpoint — prompt-based text completions; `CompletionRequest` model in `main.py`; `endpoint_path` parameter added to both proxy functions
+- Backend health checking — `BackendRouter` expanded with `_health` dict, periodic `/health` polling via `_poll_loop()`, `pick()` filters unhealthy backends (falls back to full list if all down); configurable via `BACKEND_HEALTH_INTERVAL`
+
 ---
 
 ## File map
@@ -51,6 +64,7 @@ Target: Windows, single NVIDIA GPU, llama.cpp prebuilt CUDA binaries.
 | `profiles.yaml.example` | Template profile file — copy to `profiles.yaml` |
 | `.env.example` | All env vars with defaults — copy to `.env` |
 | `requirements.txt` | Python deps |
+| `tests/` | Test suite — `test_profiles.py`, `test_proxy.py`, `test_metrics.py`, `test_main.py`, `conftest.py` |
 
 ---
 
@@ -100,6 +114,9 @@ All prefixed `ORCHESTRATOR_`. See `.env.example` for full list.
 - `VRAM_TOTAL_MB` / `VRAM_RESERVE_MB` — sanity check limits
 - `IDLE_TTL_SECONDS` — idle eviction timeout; 0 = disabled (default 600)
 - `ADMIN_KEY` — required for `/admin/*` routes
+- `CORS_ORIGINS` — comma-separated allowed origins, or `*`; empty = disabled
+- `PRELOAD_MODEL` — model ID to pre-load on startup; empty = no preload
+- `BACKEND_HEALTH_INTERVAL` — health poll interval for remote backends in seconds; 0 = disabled (default 30)
 - `LOG_DIR` — directory for rolling log files (default `logs`)
 
 ---
@@ -111,10 +128,13 @@ All prefixed `ORCHESTRATOR_`. See `.env.example` for full list.
 | GET | `/healthz` | Always `{"status": "ok"}` |
 | GET | `/status` | State machine status + PID |
 | GET | `/v1/models` | Lists profiles from YAML; includes `backend_mode` field |
-| POST | `/v1/chat/completions` | Streaming and non-streaming |
+| POST | `/v1/chat/completions` | Streaming and non-streaming; merges profile `sampling_defaults` |
+| POST | `/v1/completions` | Prompt-based text completions |
 | GET | `/metrics` | Per-model + process-level counters (JSON) |
+| GET | `/metrics/prometheus` | Same counters in Prometheus exposition format |
 | POST | `/admin/load` | Pre-load model; requires `X-Admin-Key` |
 | POST | `/admin/unload` | Unload model; requires `X-Admin-Key` |
+| POST | `/admin/reload-profiles` | Re-read `profiles.yaml` from disk; requires `X-Admin-Key` |
 | POST | `/admin/custom_run` | Spawn with flag overrides; requires `X-Admin-Key` |
 
 ---
@@ -132,7 +152,7 @@ All prefixed `ORCHESTRATOR_`. See `.env.example` for full list.
 
 ## Development branch
 
-`claude/complete-readme-phases-zR4aB`
+`claude/review-docs-improvements-vNmMT`
 
 ---
 
@@ -162,3 +182,29 @@ All prefixed `ORCHESTRATOR_`. See `.env.example` for full list.
 - `.env.example`: added `ORCHESTRATOR_LOG_DIR`
 - `profiles.yaml.example`: updated comments + remote-backend example
 - Updated README (full rewrite) and CLAUDE.md
+
+### 2026-04-10 (session 4)
+- Full audit of README.md and CLAUDE.md against all 6 source files — verified endpoints, env vars, invariants, error format, metrics output, logging, and known limitations all accurate
+- Fixed stale development branch reference in CLAUDE.md (`claude/complete-readme-phases-zR4aB` → `claude/review-docs-improvements-vNmMT`)
+- Fixed README.md setup section: added Windows `copy` commands alongside Unix `cp`
+- Expanded README.md error classification table: split into "Stderr-classified errors" and "Orchestrator/proxy errors", added 6 missing error types (`child_unreachable`, `child_timeout`, `child_connection_error`, `child_error`, `insufficient_vram`, `unsupported_operation`)
+- Implemented 5 quality-of-life improvements (Phase 4):
+  - `POST /admin/reload-profiles` — hot-reload profiles.yaml without restart
+  - Sampling defaults auto-merge — profile `sampling_defaults` injected into requests (client overrides)
+  - CORS middleware — `ORCHESTRATOR_CORS_ORIGINS` env var enables browser-based clients
+  - Startup preloading — `ORCHESTRATOR_PRELOAD_MODEL` env var warms model on boot
+  - `GET /metrics/prometheus` — Prometheus exposition format endpoint
+- `config.py`: added `cors_origins` and `preload_model` settings
+- `metrics.py`: added `to_prometheus()` method
+- `.env.example`: added `ORCHESTRATOR_CORS_ORIGINS` and `ORCHESTRATOR_PRELOAD_MODEL`
+- Version bumped to 0.4.0
+- Updated README and CLAUDE.md: new endpoints, env vars, removed resolved known limitations
+
+### 2026-04-11 (session 5)
+- Phase 5 complete — all medium improvements implemented
+- **M1: Test suite** — created `tests/` with `conftest.py`, `test_profiles.py`, `test_proxy.py`, `test_metrics.py`, `test_main.py` (56 tests total); added `pytest`, `pytest-asyncio`, `respx` to `requirements.txt`
+- **M3: Streaming token extraction** — `proxy.py`: `on_finish` callback in `proxy_chat_completions_stream()` parses final SSE `data:` line for `usage` in `_gen()` finally block; `main.py`: streaming branch defines `_on_stream_finish` callback, `finally` block guarded with `if not body.stream`
+- **M5: `/v1/completions` endpoint** — `proxy.py`: added `endpoint_path` param to both proxy functions; `main.py`: added `CompletionRequest` model and `POST /v1/completions` route
+- **M2: Backend health checking** — `main.py`: `BackendRouter` expanded with `_health` dict, `register_backends()`, `start_polling()`/`stop_polling()`, `_poll_loop()`/`_check_all()`; `pick()` filters unhealthy, falls back if all down; `config.py`: added `backend_health_interval`; `.env.example`: added `ORCHESTRATOR_BACKEND_HEALTH_INTERVAL`
+- Version bumped to 0.5.0
+- Updated README and CLAUDE.md: new endpoints, env vars, removed 2 known limitations (streaming tokens, health checking), added test suite and future plans sections
