@@ -39,5 +39,14 @@ class Settings(BaseSettings):
     # Interval (seconds) between JSON snapshot saves; 0 = disabled (no save/load)
     metrics_snapshot_interval: int = Field(60)
 
+    # Request queuing during model swap
+    # Max seconds a request will wait for the spawn lock before returning 503.
+    # 0 = wait indefinitely (original behaviour).
+    swap_timeout_seconds: int = Field(30)
+    # Max number of requests allowed to queue for a model swap at once.
+    # When the queue is full, further requests are rejected immediately with 503.
+    # 0 = unlimited.
+    swap_queue_depth: int = Field(0)
+
 
 settings = Settings()

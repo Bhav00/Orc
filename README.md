@@ -110,7 +110,7 @@ uvicorn main:app --host 127.0.0.1 --port 8080
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/healthz` | Liveness check — always returns `{"status": "ok"}` |
-| GET | `/status` | Current state, loaded model ID, child PID |
+| GET | `/status` | Current state, loaded model ID, child PID, swap queue depth |
 | GET | `/v1/models` | List all profiles (`backend_mode`: `"local"` or `"remote"`) |
 | POST | `/v1/chat/completions` | OpenAI-compatible, streaming and non-streaming |
 | POST | `/v1/completions` | OpenAI-compatible text completions (prompt-based) |
@@ -118,7 +118,8 @@ uvicorn main:app --host 127.0.0.1 --port 8080
 | GET | `/metrics/prometheus` | Same counters in Prometheus exposition format |
 | GET | `/metrics/history` | Per-model aggregates from SQLite; `?hours=N&model=id` |
 | POST | `/admin/load` | Pre-load a model into VRAM (requires `X-Admin-Key`) |
-| POST | `/admin/unload` | Unload the running model (requires `X-Admin-Key`) |
+| POST | `/admin/unload` | Graceful unload — waits for spawn lock + VRAM-drain delay (requires `X-Admin-Key`) |
+| POST | `/admin/force-unload` | Immediate SIGKILL — bypasses lock and delay; use when model is stuck (requires `X-Admin-Key`) |
 | POST | `/admin/reload-profiles` | Re-read `profiles.yaml` from disk (requires `X-Admin-Key`) |
 | POST | `/admin/custom_run` | Spawn with flag overrides (requires `X-Admin-Key`) |
 
@@ -135,7 +136,10 @@ If `ORCHESTRATOR_ADMIN_KEY` is not set, all admin routes return `503`.
 Pre-loads a local-spawn model. For remote-backend profiles returns immediately.
 
 **`POST /admin/unload`** — no body required  
-Unloads the currently running local model.
+Gracefully unloads the currently running local model. Acquires the spawn lock and waits for the post-kill VRAM-drain delay before returning.
+
+**`POST /admin/force-unload`** — no body required  
+Kills the running model immediately with SIGKILL. Bypasses the spawn lock, skips the post-kill delay, and returns at once. Use when the model is stuck mid-generation and `/admin/unload` is not responding, or when you need VRAM reclaimed urgently. Because the VRAM-drain delay is skipped, the next spawn may fail if the GPU hasn't fully released memory — retry after a few seconds if that happens.
 
 **`POST /admin/reload-profiles`** — no body required  
 Re-reads `profiles.yaml` from disk and swaps the live profile set. The currently loaded model (if any) keeps running with its original flags; new profiles take effect on the next model switch or `admin/load` call.
@@ -227,6 +231,8 @@ The `stderr_tail` array contains the last lines emitted to `llama-server` stderr
 | Child process timed out (ReadTimeout) | 504 | `child_timeout` |
 | Child connection lost mid-request | 503 | `child_connection_error` |
 | `custom_run` on a remote-backend profile | 400 | `unsupported_operation` |
+| Timed out waiting for model swap lock | 503 + `Retry-After: 5` | `swap_timeout` |
+| Swap queue is full (`SWAP_QUEUE_DEPTH` limit reached) | 503 + `Retry-After: 5` | `swap_queue_full` |
 
 ---
 
@@ -325,6 +331,8 @@ All variables are prefixed `ORCHESTRATOR_`. Defaults are shown.
 | `BACKEND_HEALTH_INTERVAL` | `30` | Health poll interval for remote backends in seconds (0 = disabled) |
 | `LOG_DIR` | `logs` | Directory for rolling log files, snapshot, and SQLite DB |
 | `METRICS_SNAPSHOT_INTERVAL` | `60` | Seconds between JSON snapshot saves; 0 = disabled (no save/load) |
+| `SWAP_TIMEOUT_SECONDS` | `30` | Max seconds to wait for model swap lock before returning 503; 0 = wait indefinitely |
+| `SWAP_QUEUE_DEPTH` | `0` | Max requests queued for a model swap; excess requests rejected immediately; 0 = unlimited |
 
 ---
 
@@ -353,6 +361,5 @@ The test suite uses `pytest` with `pytest-asyncio` for async tests and `respx` f
 
 ## Future plans
 
-- **Request queuing during model swap** — configurable timeout + `Retry-After` header for requests blocked on the spawn lock instead of hanging indefinitely; optional queue depth limit to reject excess requests early
 - **Multi-model on one GPU** — load multiple small models concurrently when VRAM allows
 - **SQLite DB housekeeping** — automatic pruning of old rows (e.g. keep last 30 days) to cap disk usage
