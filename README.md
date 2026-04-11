@@ -322,5 +322,6 @@ The test suite uses `pytest` with `pytest-asyncio` for async tests and `respx` f
 
 ## Future plans
 
+- **Request queuing during model swap** — configurable timeout + `Retry-After` header for requests blocked on the spawn lock instead of hanging indefinitely; optional queue depth limit to reject excess requests early
 - **Multi-model on one GPU** — load multiple small models concurrently when VRAM allows
-- **Persistent metrics (L4)** — survive restarts via SQLite or flat file
+- **Persistent metrics** — survive restarts via SQLite or flat file
