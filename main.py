@@ -17,6 +17,7 @@ from pydantic import BaseModel
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from config import settings
+from db import MetricsDB
 from metrics import MetricsStore
 from process_manager import OrcError, ProcessManager
 from profiles import BackendEntry, load_profiles
@@ -177,6 +178,16 @@ class AdminCustomRunRequest(BaseModel):
 # App lifespan
 # ---------------------------------------------------------------------------
 
+async def _metrics_snapshot_loop(metrics: MetricsStore, path: str, interval: int) -> None:
+    """Periodically write the in-memory metrics snapshot to disk."""
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            metrics.save_to_file(path)
+        except Exception as exc:
+            log.warning("Failed to write metrics snapshot: %s", exc)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     _setup_file_logging(settings.log_dir)
@@ -184,7 +195,22 @@ async def lifespan(app: FastAPI):
     profiles = load_profiles(settings.profiles_path)
     log.info("Loaded %d model profile(s): %s", len(profiles.models), list(profiles.models.keys()))
 
+    # Metrics — restore aggregate counters from the JSON snapshot if it exists
+    snapshot_path = os.path.join(settings.log_dir, "metrics.json")
     metrics = MetricsStore()
+    if settings.metrics_snapshot_interval > 0:
+        metrics.load_from_file(snapshot_path)
+        log.info("Metrics snapshot loaded from %s", snapshot_path)
+
+    # SQLite — per-request historical store
+    db_path = os.path.join(settings.log_dir, "metrics.db")
+    db = MetricsDB(db_path)
+    try:
+        await db.init()
+        log.info("Metrics DB initialised at %s", db_path)
+    except Exception as exc:
+        log.error("Failed to initialise metrics DB: %s — history endpoint will be unavailable", exc)
+        db = None  # type: ignore[assignment]
 
     pm = ProcessManager(settings)
     pm.set_profiles(profiles)
@@ -199,6 +225,15 @@ async def lifespan(app: FastAPI):
     app.state.profiles = profiles
     app.state.metrics = metrics
     app.state.backend_router = router
+    app.state.db = db
+
+    # Start periodic snapshot task
+    snapshot_task: asyncio.Task | None = None
+    if settings.metrics_snapshot_interval > 0:
+        snapshot_task = asyncio.create_task(
+            _metrics_snapshot_loop(metrics, snapshot_path, settings.metrics_snapshot_interval),
+            name="metrics-snapshot",
+        )
 
     if settings.preload_model:
         model_id = settings.preload_model
@@ -215,12 +250,24 @@ async def lifespan(app: FastAPI):
     pm.stop_idle_reaper()
     await pm.kill_current()
 
+    # Save final snapshot and close DB
+    if snapshot_task is not None:
+        snapshot_task.cancel()
+    if settings.metrics_snapshot_interval > 0:
+        try:
+            metrics.save_to_file(snapshot_path)
+            log.info("Final metrics snapshot saved to %s", snapshot_path)
+        except Exception as exc:
+            log.warning("Failed to write final metrics snapshot: %s", exc)
+    if db is not None:
+        await db.close()
+
 
 # ---------------------------------------------------------------------------
 # App
 # ---------------------------------------------------------------------------
 
-app = FastAPI(title="Orc", version="0.5.0", lifespan=lifespan)
+app = FastAPI(title="Orc", version="0.6.0", lifespan=lifespan)
 app.add_middleware(SessionMiddleware)
 
 if settings.cors_origins:
@@ -302,6 +349,7 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
     profiles = request.app.state.profiles
     router: BackendRouter = request.app.state.backend_router
     metrics: MetricsStore = request.app.state.metrics
+    db: MetricsDB | None = getattr(request.app.state, "db", None)
     session_id: str = getattr(request.state, "session_id", "-")
     t0 = time.monotonic()
 
@@ -352,6 +400,12 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
                         "completion_tokens": ct,
                     })
                 )
+                if db is not None:
+                    asyncio.create_task(db.insert_request(
+                        session_id=session_id, model=body.model, stream=True,
+                        latency_ms=latency_ms, status=200,
+                        prompt_tokens=pt, completion_tokens=ct, error=False,
+                    ))
 
             gen = await proxy_chat_completions_stream(
                 request_body=body_dict,
@@ -398,6 +452,13 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
                     "completion_tokens": completion_tokens,
                 })
             )
+            if db is not None:
+                asyncio.create_task(db.insert_request(
+                    session_id=session_id, model=body.model, stream=False,
+                    latency_ms=latency_ms, status=http_status,
+                    prompt_tokens=prompt_tokens, completion_tokens=completion_tokens,
+                    error=had_error,
+                ))
 
 
 @app.post("/v1/completions")
@@ -406,6 +467,7 @@ async def completions(body: CompletionRequest, request: Request):
     profiles = request.app.state.profiles
     router: BackendRouter = request.app.state.backend_router
     metrics: MetricsStore = request.app.state.metrics
+    db: MetricsDB | None = getattr(request.app.state, "db", None)
     session_id: str = getattr(request.state, "session_id", "-")
     t0 = time.monotonic()
 
@@ -444,6 +506,12 @@ async def completions(body: CompletionRequest, request: Request):
                     "stream": True, "latency_ms": round(latency_ms, 1),
                     "status": 200, "prompt_tokens": pt, "completion_tokens": ct,
                 }))
+                if db is not None:
+                    asyncio.create_task(db.insert_request(
+                        session_id=session_id, model=body.model, stream=True,
+                        latency_ms=latency_ms, status=200,
+                        prompt_tokens=pt, completion_tokens=ct, error=False,
+                    ))
 
             gen = await proxy_chat_completions_stream(
                 request_body=body_dict, target_url=target_url,
@@ -482,6 +550,13 @@ async def completions(body: CompletionRequest, request: Request):
                 "status": http_status, "prompt_tokens": prompt_tokens,
                 "completion_tokens": completion_tokens,
             }))
+            if db is not None:
+                asyncio.create_task(db.insert_request(
+                    session_id=session_id, model=body.model, stream=False,
+                    latency_ms=latency_ms, status=http_status,
+                    prompt_tokens=prompt_tokens, completion_tokens=completion_tokens,
+                    error=had_error,
+                ))
 
 
 @app.get("/metrics")
@@ -496,6 +571,27 @@ async def get_metrics_prometheus(request: Request) -> PlainTextResponse:
     """Metrics in Prometheus exposition format (text/plain)."""
     metrics: MetricsStore = request.app.state.metrics
     return PlainTextResponse(metrics.to_prometheus(), media_type="text/plain; version=0.0.4")
+
+
+@app.get("/metrics/history")
+async def get_metrics_history(
+    request: Request,
+    hours: int = 24,
+    model: str | None = None,
+) -> dict:
+    """Per-request history from SQLite, aggregated over the last *hours* hours.
+
+    Query params:
+        hours (int): Look-back window in hours (default 24).
+        model (str): Restrict to a specific model ID (optional).
+    """
+    db: MetricsDB | None = getattr(request.app.state, "db", None)
+    if db is None:
+        return JSONResponse(  # type: ignore[return-value]
+            status_code=503,
+            content={"error": "SQLite metrics store is not available"},
+        )
+    return await db.query_history(hours=hours, model=model)
 
 
 # ---------------------------------------------------------------------------

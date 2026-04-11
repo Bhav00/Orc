@@ -43,7 +43,8 @@ Ollama swallows llama-server errors and returns empty `200` responses. Orc captu
 ```
 main.py               FastAPI app, routes, middleware, lifespan, exception handler
 config.py             Env var loading (pydantic-settings)
-metrics.py            MetricsStore — in-process request and spawn counters
+metrics.py            MetricsStore — in-process request and spawn counters + JSON snapshot
+db.py                 MetricsDB — SQLite-backed per-request historical store
 profiles.py           YAML profile loader, Pydantic models, CLI-arg builder
 process_manager.py    Spawn/kill state machine, stderr capture (OrcError lives here)
 proxy.py              HTTP proxy to child or remote backend, error classification
@@ -53,7 +54,7 @@ profiles.yaml.example Template with local and remote-backend examples
 .env.example          All supported env vars with defaults
 requirements.txt      Python dependencies
 tests/                Test suite (pytest + respx)
-logs/                 Rolling log files (created on first run)
+logs/                 Rolling log files + metrics.json snapshot + metrics.db (created on first run)
 ```
 
 ---
@@ -115,6 +116,7 @@ uvicorn main:app --host 127.0.0.1 --port 8080
 | POST | `/v1/completions` | OpenAI-compatible text completions (prompt-based) |
 | GET | `/metrics` | Per-model request counters + process-level spawn/kill stats (JSON) |
 | GET | `/metrics/prometheus` | Same counters in Prometheus exposition format |
+| GET | `/metrics/history` | Per-model aggregates from SQLite; `?hours=N&model=id` |
 | POST | `/admin/load` | Pre-load a model into VRAM (requires `X-Admin-Key`) |
 | POST | `/admin/unload` | Unload the running model (requires `X-Admin-Key`) |
 | POST | `/admin/reload-profiles` | Re-read `profiles.yaml` from disk (requires `X-Admin-Key`) |
@@ -236,6 +238,8 @@ On startup, Orc creates the `logs/` directory (configurable via `ORCHESTRATOR_LO
 |------|----------|----------|
 | `logs/orc.log` | Full application log at INFO level | Daily, 14-day retention |
 | `logs/requests.jsonl` | One JSON object per `/v1/chat/completions` request | Daily, 14-day retention |
+| `logs/metrics.json` | Aggregate counter snapshot (restored on restart) | Overwritten each save |
+| `logs/metrics.db` | SQLite per-request rows (historical queries) | Append-only, never rotated |
 
 Each line in `requests.jsonl`:
 ```json
@@ -270,6 +274,33 @@ For streaming requests, token counts are extracted from the final SSE `data:` ch
 }
 ```
 
+### Metrics persistence
+
+**Aggregate snapshot** (`logs/metrics.json`) — the in-memory counters are written to disk every `ORCHESTRATOR_METRICS_SNAPSHOT_INTERVAL` seconds (default 60) and once more on clean shutdown. On next startup they are restored, so counters survive a restart. Disabled when the interval is set to `0`.
+
+**Per-request SQLite** (`logs/metrics.db`) — every request is appended as a row, enabling historical queries. Use `GET /metrics/history` to query it:
+
+```
+GET /metrics/history?hours=48&model=qwen2.5-14b-q5
+```
+
+```json
+{
+  "window_hours": 48,
+  "models": {
+    "qwen2.5-14b-q5": {
+      "requests": 120,
+      "prompt_tokens": 54000,
+      "completion_tokens": 9800,
+      "errors": 2,
+      "avg_latency_ms": 1870.3
+    }
+  }
+}
+```
+
+Omit `model` to see all models. The SQLite file is append-only and never rotated — manage it manually if disk space is a concern.
+
 ---
 
 ## Environment variables
@@ -292,14 +323,14 @@ All variables are prefixed `ORCHESTRATOR_`. Defaults are shown.
 | `CORS_ORIGINS` | *(empty)* | Comma-separated allowed origins, or `*` for all; empty = disabled |
 | `PRELOAD_MODEL` | *(empty)* | Model ID to pre-load into VRAM on startup; empty = no preload |
 | `BACKEND_HEALTH_INTERVAL` | `30` | Health poll interval for remote backends in seconds (0 = disabled) |
-| `LOG_DIR` | `logs` | Directory for rolling log files |
+| `LOG_DIR` | `logs` | Directory for rolling log files, snapshot, and SQLite DB |
+| `METRICS_SNAPSHOT_INTERVAL` | `60` | Seconds between JSON snapshot saves; 0 = disabled (no save/load) |
 
 ---
 
 ## Known limitations
 
-- **Streaming mid-stream errors.** If the child dies after the first SSE chunk is sent, the client receives an incomplete stream (HTTP headers are already committed). Pre-stream errors (connection failure, non-200 status) are still surfaced as structured JSON.
-- **Metrics not persisted.** In-process counters reset on restart.
+- **Streaming mid-stream errors produce a non-standard sentinel.** If the child dies after streaming starts, Orc injects a `data: {"error": ...}` line so the failure is detectable — but HTTP headers are already committed so the status code remains `200`. Most OpenAI-compatible client libraries will not parse this sentinel as an error and may silently stop iterating.
 
 ---
 
@@ -324,4 +355,4 @@ The test suite uses `pytest` with `pytest-asyncio` for async tests and `respx` f
 
 - **Request queuing during model swap** — configurable timeout + `Retry-After` header for requests blocked on the spawn lock instead of hanging indefinitely; optional queue depth limit to reject excess requests early
 - **Multi-model on one GPU** — load multiple small models concurrently when VRAM allows
-- **Persistent metrics** — survive restarts via SQLite or flat file
+- **SQLite DB housekeeping** — automatic pruning of old rows (e.g. keep last 30 days) to cap disk usage

@@ -167,7 +167,17 @@ async def proxy_chat_completions_stream(
         except (httpx.ReadError, httpx.RemoteProtocolError) as exc:
             if process_manager is not None:
                 process_manager._state = ChildState.DYING
+            stderr = _stderr(process_manager)
             log.warning("Streaming connection lost mid-stream: %s", exc)
+            error_payload = json.dumps({
+                "error": {
+                    "message": "Stream interrupted: connection lost mid-stream",
+                    "type": "child_connection_error",
+                    "code": "child_connection_error",
+                },
+                "stderr_tail": stderr,
+            })
+            yield f"data: {error_payload}\n\n".encode()
         finally:
             await response.aclose()
             await client.aclose()
