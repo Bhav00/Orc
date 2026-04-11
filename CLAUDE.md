@@ -16,7 +16,7 @@ Target: Windows, single NVIDIA GPU, llama.cpp prebuilt CUDA binaries.
 
 ---
 
-## Current phase: Phase 6 complete (reliability + persistence)
+## Current phase: Phase 7 complete (request queuing + force-unload)
 
 **Implemented (Phase 1):**
 - Profile loader (`profiles.py`) — YAML → Pydantic models, CLI-arg builder
@@ -56,6 +56,13 @@ Target: Windows, single NVIDIA GPU, llama.cpp prebuilt CUDA binaries.
 - `GET /metrics/history` — queries SQLite; `?hours=N&model=id` params; returns per-model aggregates for the look-back window
 - `config.py`: added `metrics_snapshot_interval`; `requirements.txt`: added `aiosqlite==0.20.0`; `.env.example`: added `ORCHESTRATOR_METRICS_SNAPSHOT_INTERVAL`
 - Version bumped to 0.6.0
+
+**Implemented (Phase 7 — request queuing + force-unload):**
+- Request queuing during model swap — `ensure_model()` refactored: `_ensure_model_locked()` extracts the locked body; outer method adds queue-depth guard (`swap_queue_depth > 0` rejects excess waiters immediately) and `asyncio.wait_for()` timeout (`swap_timeout_seconds > 0`, default 30 s); both error types (`swap_timeout`, `swap_queue_full`) return 503 with `Retry-After: 5` header via updated `orc_error_handler`; `_queue_waiters` counter exposed in `GET /status` as `swap_queue_depth`
+- Force-unload — `ProcessManager.force_kill()`: sends SIGKILL immediately, cancels stderr reader, resets state to IDLE without acquiring the lock or waiting for `post_kill_delay`; process is reaped in background via `_reap_process()` task; `POST /admin/force-unload` endpoint wired in `main.py`
+- `config.py`: added `swap_timeout_seconds: int = Field(30)` and `swap_queue_depth: int = Field(0)`
+- `.env.example`: added `ORCHESTRATOR_SWAP_TIMEOUT_SECONDS` and `ORCHESTRATOR_SWAP_QUEUE_DEPTH`
+- Version bumped to 0.7.0
 
 ---
 
@@ -128,6 +135,8 @@ All prefixed `ORCHESTRATOR_`. See `.env.example` for full list.
 - `BACKEND_HEALTH_INTERVAL` — health poll interval for remote backends in seconds; 0 = disabled (default 30)
 - `LOG_DIR` — directory for rolling log files, JSON snapshot, and SQLite DB (default `logs`)
 - `METRICS_SNAPSHOT_INTERVAL` — seconds between JSON snapshot saves; 0 = disabled (default 60)
+- `SWAP_TIMEOUT_SECONDS` — max wait for model swap lock before returning 503; 0 = unlimited (default 30)
+- `SWAP_QUEUE_DEPTH` — max requests queued for a swap; 0 = unlimited (default 0)
 
 ---
 
@@ -144,7 +153,8 @@ All prefixed `ORCHESTRATOR_`. See `.env.example` for full list.
 | GET | `/metrics/prometheus` | Same counters in Prometheus exposition format |
 | GET | `/metrics/history` | SQLite per-request history; `?hours=N&model=id` |
 | POST | `/admin/load` | Pre-load model; requires `X-Admin-Key` |
-| POST | `/admin/unload` | Unload model; requires `X-Admin-Key` |
+| POST | `/admin/unload` | Graceful unload (lock + VRAM-drain delay); requires `X-Admin-Key` |
+| POST | `/admin/force-unload` | Immediate SIGKILL, no lock, no delay; requires `X-Admin-Key` |
 | POST | `/admin/reload-profiles` | Re-read `profiles.yaml` from disk; requires `X-Admin-Key` |
 | POST | `/admin/custom_run` | Spawn with flag overrides; requires `X-Admin-Key` |
 
@@ -231,3 +241,12 @@ All prefixed `ORCHESTRATOR_`. See `.env.example` for full list.
 - `.env.example`: added `ORCHESTRATOR_METRICS_SNAPSHOT_INTERVAL`
 - Version bumped to 0.6.0
 - Updated README and CLAUDE.md: new file layout, endpoint, env var, metrics persistence section, updated known limitations (streaming limitation reframed, metrics persistence removed), updated future plans
+
+### 2026-04-11 (session 7)
+- Phase 7 complete — request queuing + force-unload
+- **Request queuing / swap timeout** — `process_manager.py`: `ensure_model()` now checks `swap_queue_depth` (reject immediately if queue full) and wraps `_ensure_model_locked()` with `asyncio.wait_for(timeout=swap_timeout_seconds)`; `_ensure_model_locked()` is new method containing the old locked body; `_queue_waiters` counter added and exposed in `get_status()`; `main.py`: `orc_error_handler` adds `Retry-After: 5` header for `swap_timeout` and `swap_queue_full` error types
+- **Force-unload** — `process_manager.py`: `force_kill()` sends SIGKILL immediately, cancels stderr reader, resets state without lock or delay, fires background `_reap_process()` task; `main.py`: `POST /admin/force-unload` endpoint added
+- `config.py`: added `swap_timeout_seconds: int = Field(30)` and `swap_queue_depth: int = Field(0)`
+- `.env.example`: added `ORCHESTRATOR_SWAP_TIMEOUT_SECONDS` and `ORCHESTRATOR_SWAP_QUEUE_DEPTH`
+- Version bumped to 0.7.0
+- Updated README and CLAUDE.md: new endpoints, env vars, error types, future plans pruned

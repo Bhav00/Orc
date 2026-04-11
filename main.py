@@ -267,7 +267,7 @@ async def lifespan(app: FastAPI):
 # App
 # ---------------------------------------------------------------------------
 
-app = FastAPI(title="Orc", version="0.6.0", lifespan=lifespan)
+app = FastAPI(title="Orc", version="0.7.0", lifespan=lifespan)
 app.add_middleware(SessionMiddleware)
 
 if settings.cors_origins:
@@ -298,6 +298,10 @@ def require_admin(x_admin_key: str | None = Header(None)) -> None:
 
 @app.exception_handler(OrcError)
 async def orc_error_handler(request: Request, exc: OrcError) -> JSONResponse:
+    headers: dict[str, str] = {}
+    if exc.error_type in ("swap_timeout", "swap_queue_full"):
+        # Tell clients how long to wait before retrying (rough heuristic: 5s)
+        headers["Retry-After"] = "5"
     return JSONResponse(
         status_code=exc.status_code,
         content={
@@ -308,6 +312,7 @@ async def orc_error_handler(request: Request, exc: OrcError) -> JSONResponse:
             },
             "stderr_tail": exc.stderr_tail,
         },
+        headers=headers,
     )
 
 
@@ -629,6 +634,24 @@ async def admin_unload(
     pm: ProcessManager = request.app.state.process_manager
     await pm.kill_current()
     return {"status": "ok"}
+
+
+@app.post("/admin/force-unload")
+async def admin_force_unload(
+    request: Request,
+    _: None = Depends(require_admin),
+) -> dict:
+    """Kill the current model immediately — no graceful shutdown, no post-kill delay.
+
+    Use when the model is stuck mid-generation and /admin/unload is blocking,
+    or when VRAM needs to be reclaimed right now without waiting.
+    Unlike /admin/unload, this bypasses the spawn lock and skips the VRAM-drain
+    delay, so the next spawn may fail if VRAM has not fully released yet.
+    Requires X-Admin-Key header.
+    """
+    pm: ProcessManager = request.app.state.process_manager
+    result = await pm.force_kill()
+    return {"status": "ok", **result}
 
 
 @app.post("/admin/reload-profiles")

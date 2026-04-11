@@ -60,6 +60,7 @@ class ProcessManager:
         self._last_used_at: float | None = None
         self._reaper_task: asyncio.Task | None = None
         self._metrics: MetricsStore | None = None
+        self._queue_waiters: int = 0  # requests waiting for the spawn lock
 
     def set_profiles(self, profiles: ProfilesFile) -> None:
         self._profiles = profiles
@@ -85,6 +86,38 @@ class ProcessManager:
             self._last_used_at = time.monotonic()
             return
 
+        # Queue depth guard: reject immediately if too many requests are already
+        # waiting for a model swap (swap_queue_depth == 0 means unlimited).
+        max_q = self._settings.swap_queue_depth
+        if max_q > 0 and self._queue_waiters >= max_q:
+            raise OrcError(
+                503,
+                f"Model swap queue is full ({self._queue_waiters}/{max_q} waiters). "
+                "Try again shortly.",
+                error_type="swap_queue_full",
+            )
+
+        self._queue_waiters += 1
+        try:
+            timeout = self._settings.swap_timeout_seconds
+            if timeout > 0:
+                try:
+                    await asyncio.wait_for(
+                        self._ensure_model_locked(model_id), timeout=float(timeout)
+                    )
+                except asyncio.TimeoutError:
+                    raise OrcError(
+                        503,
+                        f"Timed out after {timeout}s waiting for model swap to complete.",
+                        error_type="swap_timeout",
+                    )
+            else:
+                await self._ensure_model_locked(model_id)
+        finally:
+            self._queue_waiters -= 1
+
+    async def _ensure_model_locked(self, model_id: str) -> None:
+        """Body of ensure_model that runs under the spawn lock."""
         async with self._lock:
             # Re-check under lock — another coroutine may have done the work
             if (
@@ -154,6 +187,56 @@ class ProcessManager:
             await self._spawn(model_id, custom_profile)
             self._last_used_at = time.monotonic()
 
+    async def force_kill(self) -> dict:
+        """Kill the child process immediately — no graceful shutdown, no post-kill delay,
+        no lock acquisition.
+
+        Use this when the normal kill pathway is stuck (e.g. a long spawn or an
+        in-flight request that won't finish), or when VRAM needs to be reclaimed
+        right now.  The state machine self-corrects on the next ensure_model() call.
+
+        Returns a dict describing what was done.
+        """
+        child = self._child
+        if child is None:
+            return {"killed": False, "reason": "no model loaded"}
+
+        proc = child.process
+        model_id = child.model_id
+        pid = proc.pid
+
+        # SIGKILL — skip SIGTERM / graceful wait entirely
+        if proc.returncode is None:
+            log.warning("Force-killing model %r (pid=%d)", model_id, pid)
+            proc.kill()
+
+        # Cancel the stderr reader so the pipe drains and the task exits
+        task = child._stderr_reader_task
+        if task is not None and not task.done():
+            task.cancel()
+
+        # Update state immediately — no post_kill_delay, no lock held
+        self._child = None
+        self._state = ChildState.IDLE
+        if self._metrics is not None:
+            self._metrics.record_kill()
+
+        # Reap the process in the background to avoid zombie processes
+        asyncio.create_task(self._reap_process(proc), name=f"reap-{pid}")
+
+        log.info("Force kill issued for model %r (pid=%d) — state reset to IDLE", model_id, pid)
+        return {"killed": True, "model_id": model_id, "pid": pid}
+
+    async def _reap_process(self, proc: asyncio.subprocess.Process) -> None:
+        """Wait for a forcibly-killed process to exit (prevents zombie processes)."""
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=10.0)
+            log.debug("Reaped process pid=%d (rc=%s)", proc.pid, proc.returncode)
+        except asyncio.TimeoutError:
+            log.warning("Process pid=%d still alive 10s after force kill", proc.pid)
+        except Exception as exc:
+            log.warning("Error reaping process pid=%d: %s", proc.pid, exc)
+
     def start_idle_reaper(self) -> None:
         """Start the background task that evicts idle models. No-op if TTL is 0."""
         if self._settings.idle_ttl_seconds > 0:
@@ -172,6 +255,7 @@ class ProcessManager:
             "model_id": self._child.model_id if self._child else None,
             "pid": self._child.process.pid if self._child else None,
             "stderr_tail_lines": len(self._child.stderr_tail) if self._child else 0,
+            "swap_queue_depth": self._queue_waiters,
         }
 
     def get_stderr_tail(self, n: int = 20) -> list[str]:
