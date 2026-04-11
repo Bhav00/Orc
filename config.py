@@ -23,6 +23,9 @@ class Settings(BaseSettings):
     idle_ttl_seconds: int = Field(600)
     admin_key: str | None = Field(None)
 
+    # Backend health polling interval for remote profiles (seconds); 0 = disabled
+    backend_health_interval: int = Field(30)
+
     # CORS — comma-separated origins, or "*" for all; empty = disabled
     cors_origins: str = Field("")
 

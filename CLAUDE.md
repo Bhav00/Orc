@@ -43,6 +43,12 @@ Target: Windows, single NVIDIA GPU, llama.cpp prebuilt CUDA binaries.
 - Startup preloading — `ORCHESTRATOR_PRELOAD_MODEL` env var; when set, `ensure_model()` is called during lifespan startup
 - Prometheus metrics — `GET /metrics/prometheus` returns counters in Prometheus exposition format; `MetricsStore.to_prometheus()` renders text/plain output
 
+**Implemented (Phase 5 — medium improvements):**
+- Test suite (`tests/`) — pytest + pytest-asyncio + respx; 56 tests covering profiles, proxy, metrics, backend router, sampling defaults
+- Streaming token extraction — `on_finish` callback in `proxy_chat_completions_stream()` parses final SSE `data:` chunk for `usage`; metrics and request log now capture token counts for streaming requests
+- `/v1/completions` endpoint — prompt-based text completions; `CompletionRequest` model in `main.py`; `endpoint_path` parameter added to both proxy functions
+- Backend health checking — `BackendRouter` expanded with `_health` dict, periodic `/health` polling via `_poll_loop()`, `pick()` filters unhealthy backends (falls back to full list if all down); configurable via `BACKEND_HEALTH_INTERVAL`
+
 ---
 
 ## File map
@@ -58,6 +64,7 @@ Target: Windows, single NVIDIA GPU, llama.cpp prebuilt CUDA binaries.
 | `profiles.yaml.example` | Template profile file — copy to `profiles.yaml` |
 | `.env.example` | All env vars with defaults — copy to `.env` |
 | `requirements.txt` | Python deps |
+| `tests/` | Test suite — `test_profiles.py`, `test_proxy.py`, `test_metrics.py`, `test_main.py`, `conftest.py` |
 
 ---
 
@@ -109,6 +116,7 @@ All prefixed `ORCHESTRATOR_`. See `.env.example` for full list.
 - `ADMIN_KEY` — required for `/admin/*` routes
 - `CORS_ORIGINS` — comma-separated allowed origins, or `*`; empty = disabled
 - `PRELOAD_MODEL` — model ID to pre-load on startup; empty = no preload
+- `BACKEND_HEALTH_INTERVAL` — health poll interval for remote backends in seconds; 0 = disabled (default 30)
 - `LOG_DIR` — directory for rolling log files (default `logs`)
 
 ---
@@ -121,6 +129,7 @@ All prefixed `ORCHESTRATOR_`. See `.env.example` for full list.
 | GET | `/status` | State machine status + PID |
 | GET | `/v1/models` | Lists profiles from YAML; includes `backend_mode` field |
 | POST | `/v1/chat/completions` | Streaming and non-streaming; merges profile `sampling_defaults` |
+| POST | `/v1/completions` | Prompt-based text completions |
 | GET | `/metrics` | Per-model + process-level counters (JSON) |
 | GET | `/metrics/prometheus` | Same counters in Prometheus exposition format |
 | POST | `/admin/load` | Pre-load model; requires `X-Admin-Key` |
@@ -190,3 +199,12 @@ All prefixed `ORCHESTRATOR_`. See `.env.example` for full list.
 - `.env.example`: added `ORCHESTRATOR_CORS_ORIGINS` and `ORCHESTRATOR_PRELOAD_MODEL`
 - Version bumped to 0.4.0
 - Updated README and CLAUDE.md: new endpoints, env vars, removed resolved known limitations
+
+### 2026-04-11 (session 5)
+- Phase 5 complete — all medium improvements implemented
+- **M1: Test suite** — created `tests/` with `conftest.py`, `test_profiles.py`, `test_proxy.py`, `test_metrics.py`, `test_main.py` (56 tests total); added `pytest`, `pytest-asyncio`, `respx` to `requirements.txt`
+- **M3: Streaming token extraction** — `proxy.py`: `on_finish` callback in `proxy_chat_completions_stream()` parses final SSE `data:` line for `usage` in `_gen()` finally block; `main.py`: streaming branch defines `_on_stream_finish` callback, `finally` block guarded with `if not body.stream`
+- **M5: `/v1/completions` endpoint** — `proxy.py`: added `endpoint_path` param to both proxy functions; `main.py`: added `CompletionRequest` model and `POST /v1/completions` route
+- **M2: Backend health checking** — `main.py`: `BackendRouter` expanded with `_health` dict, `register_backends()`, `start_polling()`/`stop_polling()`, `_poll_loop()`/`_check_all()`; `pick()` filters unhealthy, falls back if all down; `config.py`: added `backend_health_interval`; `.env.example`: added `ORCHESTRATOR_BACKEND_HEALTH_INTERVAL`
+- Version bumped to 0.5.0
+- Updated README and CLAUDE.md: new endpoints, env vars, removed 2 known limitations (streaming tokens, health checking), added test suite and future plans sections

@@ -52,6 +52,7 @@ profiles.yaml.example Template with local and remote-backend examples
 .env                  Your env vars (gitignored — copy from .env.example)
 .env.example          All supported env vars with defaults
 requirements.txt      Python dependencies
+tests/                Test suite (pytest + respx)
 logs/                 Rolling log files (created on first run)
 ```
 
@@ -111,6 +112,7 @@ uvicorn main:app --host 127.0.0.1 --port 8080
 | GET | `/status` | Current state, loaded model ID, child PID |
 | GET | `/v1/models` | List all profiles (`backend_mode`: `"local"` or `"remote"`) |
 | POST | `/v1/chat/completions` | OpenAI-compatible, streaming and non-streaming |
+| POST | `/v1/completions` | OpenAI-compatible text completions (prompt-based) |
 | GET | `/metrics` | Per-model request counters + process-level spawn/kill stats (JSON) |
 | GET | `/metrics/prometheus` | Same counters in Prometheus exposition format |
 | POST | `/admin/load` | Pre-load a model into VRAM (requires `X-Admin-Key`) |
@@ -240,7 +242,7 @@ Each line in `requests.jsonl`:
 {"session_id": "...", "model": "...", "stream": false, "latency_ms": 123.4, "status": 200, "prompt_tokens": 512, "completion_tokens": 64}
 ```
 
-For streaming requests, `prompt_tokens` and `completion_tokens` are `0` (headers are committed before the stream completes).
+For streaming requests, token counts are extracted from the final SSE `data:` chunk (llama-server includes `usage` there). If the stream ends without usage data, both counts default to `0`.
 
 ---
 
@@ -289,6 +291,7 @@ All variables are prefixed `ORCHESTRATOR_`. Defaults are shown.
 | `ADMIN_KEY` | *(none)* | Required for `/admin/*` routes |
 | `CORS_ORIGINS` | *(empty)* | Comma-separated allowed origins, or `*` for all; empty = disabled |
 | `PRELOAD_MODEL` | *(empty)* | Model ID to pre-load into VRAM on startup; empty = no preload |
+| `BACKEND_HEALTH_INTERVAL` | `30` | Health poll interval for remote backends in seconds (0 = disabled) |
 | `LOG_DIR` | `logs` | Directory for rolling log files |
 
 ---
@@ -296,6 +299,28 @@ All variables are prefixed `ORCHESTRATOR_`. Defaults are shown.
 ## Known limitations
 
 - **Streaming mid-stream errors.** If the child dies after the first SSE chunk is sent, the client receives an incomplete stream (HTTP headers are already committed). Pre-stream errors (connection failure, non-200 status) are still surfaced as structured JSON.
-- **Streaming token counts not logged.** `prompt_tokens`/`completion_tokens` are `0` in `requests.jsonl` for streaming requests.
-- **No backend health checking.** For remote-backend profiles, unhealthy backends stay in the round-robin rotation until they respond. A failed request to a backend returns an error to the client.
 - **Metrics not persisted.** In-process counters reset on restart.
+
+---
+
+## Testing
+
+```
+pip install -r requirements.txt
+pytest -v
+```
+
+The test suite uses `pytest` with `pytest-asyncio` for async tests and `respx` for mocking `httpx` calls. Tests cover:
+
+- **Profile loading** — `build_cli_args` flag conversion, model validation, YAML parsing
+- **Proxy layer** — stderr classification, non-streaming/streaming error handling, endpoint path routing
+- **Metrics** — per-model counters, spawn/kill tracking, Prometheus export
+- **Backend router** — round-robin, trailing-slash normalization, health filtering, fallback when all unhealthy
+- **Sampling defaults** — merge logic, client-override precedence
+
+---
+
+## Future plans
+
+- **Multi-model on one GPU** — load multiple small models concurrently when VRAM allows
+- **Persistent metrics (L4)** — survive restarts via SQLite or flat file

@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import logging.handlers
@@ -6,6 +7,8 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 from typing import Any
+
+import httpx as _httpx
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -79,16 +82,66 @@ class SessionMiddleware(BaseHTTPMiddleware):
 # ---------------------------------------------------------------------------
 
 class BackendRouter:
-    """Stateful round-robin picker for multi-backend model profiles."""
+    """Round-robin picker with background health checking for remote backends."""
 
-    def __init__(self) -> None:
+    def __init__(self, poll_interval: float = 30.0) -> None:
         self._counters: dict[str, int] = {}
+        self._health: dict[str, bool] = {}
+        self._poll_interval = poll_interval
+        self._poll_task: asyncio.Task | None = None
+        self._all_urls: set[str] = set()
+
+    def register_backends(self, profiles) -> None:
+        """Scan profiles for remote backend URLs and register them for polling."""
+        self._all_urls.clear()
+        for profile in profiles.models.values():
+            for be in profile.backends:
+                url = be.url.rstrip("/")
+                self._all_urls.add(url)
+                self._health.setdefault(url, True)
 
     def pick(self, model_id: str, backends: list[BackendEntry]) -> str:
+        """Pick a healthy backend round-robin. Falls back to any if all unhealthy."""
+        urls = [be.url.rstrip("/") for be in backends]
+        healthy = [u for u in urls if self._health.get(u, True)]
+        candidates = healthy if healthy else urls
+
         idx = self._counters.get(model_id, 0)
-        url = backends[idx % len(backends)].url
+        url = candidates[idx % len(candidates)]
         self._counters[model_id] = idx + 1
-        return url.rstrip("/")
+        return url
+
+    def start_polling(self) -> None:
+        if self._all_urls and self._poll_interval > 0:
+            self._poll_task = asyncio.create_task(
+                self._poll_loop(), name="health-poller"
+            )
+
+    def stop_polling(self) -> None:
+        if self._poll_task and not self._poll_task.done():
+            self._poll_task.cancel()
+
+    async def _poll_loop(self) -> None:
+        while True:
+            await asyncio.sleep(self._poll_interval)
+            await self._check_all()
+
+    async def _check_all(self) -> None:
+        async with _httpx.AsyncClient(timeout=5.0) as client:
+            for url in list(self._all_urls):
+                try:
+                    resp = await client.get(f"{url}/health")
+                    was_healthy = self._health.get(url, True)
+                    now_healthy = resp.status_code == 200
+                    self._health[url] = now_healthy
+                    if was_healthy and not now_healthy:
+                        log.warning("Backend %s is now UNHEALTHY (status %d)", url, resp.status_code)
+                    elif not was_healthy and now_healthy:
+                        log.info("Backend %s recovered — marking healthy", url)
+                except Exception:
+                    if self._health.get(url, True):
+                        log.warning("Backend %s is UNREACHABLE — marking unhealthy", url)
+                    self._health[url] = False
 
 
 # ---------------------------------------------------------------------------
@@ -101,6 +154,13 @@ class ChatCompletionRequest(BaseModel):
     stream: bool = False
     # All extra fields (temperature, top_p, max_tokens, tools, etc.) are
     # preserved and forwarded as-is to the child.
+    model_config = {"extra": "allow"}
+
+
+class CompletionRequest(BaseModel):
+    model: str
+    prompt: str | list[str]
+    stream: bool = False
     model_config = {"extra": "allow"}
 
 
@@ -131,10 +191,14 @@ async def lifespan(app: FastAPI):
     pm.set_metrics(metrics)
     pm.start_idle_reaper()
 
+    router = BackendRouter(poll_interval=settings.backend_health_interval)
+    router.register_backends(profiles)
+    router.start_polling()
+
     app.state.process_manager = pm
     app.state.profiles = profiles
     app.state.metrics = metrics
-    app.state.backend_router = BackendRouter()
+    app.state.backend_router = router
 
     if settings.preload_model:
         model_id = settings.preload_model
@@ -147,6 +211,7 @@ async def lifespan(app: FastAPI):
     yield
 
     log.info("Shutting down — unloading any running model")
+    router.stop_polling()
     pm.stop_idle_reaper()
     await pm.kill_current()
 
@@ -155,7 +220,7 @@ async def lifespan(app: FastAPI):
 # App
 # ---------------------------------------------------------------------------
 
-app = FastAPI(title="Orc", version="0.4.0", lifespan=lifespan)
+app = FastAPI(title="Orc", version="0.5.0", lifespan=lifespan)
 app.add_middleware(SessionMiddleware)
 
 if settings.cors_origins:
@@ -267,12 +332,33 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
                 body_dict.setdefault(key, value)
 
         if body.stream:
+            def _on_stream_finish(pt: int, ct: int) -> None:
+                latency_ms = (time.monotonic() - t0) * 1000
+                metrics.record_request(
+                    model_id=body.model,
+                    latency_ms=latency_ms,
+                    prompt_tokens=pt,
+                    completion_tokens=ct,
+                    error=False,
+                )
+                req_log.info(
+                    json.dumps({
+                        "session_id": session_id,
+                        "model": body.model,
+                        "stream": True,
+                        "latency_ms": round(latency_ms, 1),
+                        "status": 200,
+                        "prompt_tokens": pt,
+                        "completion_tokens": ct,
+                    })
+                )
+
             gen = await proxy_chat_completions_stream(
                 request_body=body_dict,
                 target_url=target_url,
                 process_manager=pm_for_proxy,
+                on_finish=_on_stream_finish,
             )
-            # Token counts unavailable for streaming (headers already committed once we return)
             return StreamingResponse(gen, media_type="text/event-stream")
 
         result = await proxy_chat_completions(
@@ -291,25 +377,111 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
         raise
 
     finally:
-        latency_ms = (time.monotonic() - t0) * 1000
-        metrics.record_request(
-            model_id=body.model,
-            latency_ms=latency_ms,
-            prompt_tokens=prompt_tokens,
-            completion_tokens=completion_tokens,
-            error=had_error,
+        # Streaming metrics are recorded via the on_finish callback
+        if not body.stream:
+            latency_ms = (time.monotonic() - t0) * 1000
+            metrics.record_request(
+                model_id=body.model,
+                latency_ms=latency_ms,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                error=had_error,
+            )
+            req_log.info(
+                json.dumps({
+                    "session_id": session_id,
+                    "model": body.model,
+                    "stream": False,
+                    "latency_ms": round(latency_ms, 1),
+                    "status": http_status,
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": completion_tokens,
+                })
+            )
+
+
+@app.post("/v1/completions")
+async def completions(body: CompletionRequest, request: Request):
+    pm: ProcessManager = request.app.state.process_manager
+    profiles = request.app.state.profiles
+    router: BackendRouter = request.app.state.backend_router
+    metrics: MetricsStore = request.app.state.metrics
+    session_id: str = getattr(request.state, "session_id", "-")
+    t0 = time.monotonic()
+
+    prompt_tokens = completion_tokens = 0
+    http_status = 200
+    had_error = False
+
+    try:
+        profile = profiles.models.get(body.model)
+        if profile is None:
+            raise OrcError(404, f"Unknown model: {body.model!r}. Check profiles.yaml.")
+
+        if profile.backends:
+            target_url = router.pick(body.model, profile.backends)
+            pm_for_proxy = None
+        else:
+            await pm.ensure_model(body.model)
+            target_url = f"http://127.0.0.1:{settings.child_port}"
+            pm_for_proxy = pm
+
+        body_dict = body.model_dump()
+
+        if profile.sampling_defaults:
+            for key, value in profile.sampling_defaults.items():
+                body_dict.setdefault(key, value)
+
+        if body.stream:
+            def _on_stream_finish(pt: int, ct: int) -> None:
+                latency_ms = (time.monotonic() - t0) * 1000
+                metrics.record_request(
+                    model_id=body.model, latency_ms=latency_ms,
+                    prompt_tokens=pt, completion_tokens=ct, error=False,
+                )
+                req_log.info(json.dumps({
+                    "session_id": session_id, "model": body.model,
+                    "stream": True, "latency_ms": round(latency_ms, 1),
+                    "status": 200, "prompt_tokens": pt, "completion_tokens": ct,
+                }))
+
+            gen = await proxy_chat_completions_stream(
+                request_body=body_dict, target_url=target_url,
+                process_manager=pm_for_proxy,
+                endpoint_path="/v1/completions",
+                on_finish=_on_stream_finish,
+            )
+            return StreamingResponse(gen, media_type="text/event-stream")
+
+        result = await proxy_chat_completions(
+            request_body=body_dict, target_url=target_url,
+            process_manager=pm_for_proxy,
+            endpoint_path="/v1/completions",
         )
-        req_log.info(
-            json.dumps({
-                "session_id": session_id,
-                "model": body.model,
-                "stream": body.stream,
-                "latency_ms": round(latency_ms, 1),
-                "status": http_status,
-                "prompt_tokens": prompt_tokens,
+        usage = result.get("usage") or {}
+        prompt_tokens = usage.get("prompt_tokens", 0)
+        completion_tokens = usage.get("completion_tokens", 0)
+        return result
+
+    except OrcError as exc:
+        had_error = True
+        http_status = exc.status_code
+        raise
+
+    finally:
+        if not body.stream:
+            latency_ms = (time.monotonic() - t0) * 1000
+            metrics.record_request(
+                model_id=body.model, latency_ms=latency_ms,
+                prompt_tokens=prompt_tokens, completion_tokens=completion_tokens,
+                error=had_error,
+            )
+            req_log.info(json.dumps({
+                "session_id": session_id, "model": body.model,
+                "stream": False, "latency_ms": round(latency_ms, 1),
+                "status": http_status, "prompt_tokens": prompt_tokens,
                 "completion_tokens": completion_tokens,
-            })
-        )
+            }))
 
 
 @app.get("/metrics")
@@ -378,6 +550,8 @@ async def admin_reload_profiles(
     pm: ProcessManager = request.app.state.process_manager
     pm.set_profiles(profiles)
     request.app.state.profiles = profiles
+    router: BackendRouter = request.app.state.backend_router
+    router.register_backends(profiles)
     log.info("Reloaded %d profile(s): %s", len(profiles.models), list(profiles.models.keys()))
     return {"status": "ok", "profiles": list(profiles.models.keys())}
 
