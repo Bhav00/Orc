@@ -16,7 +16,7 @@ Target: Windows, single NVIDIA GPU, llama.cpp prebuilt CUDA binaries.
 
 ---
 
-## Current phase: All phases complete
+## Current phase: Phase 6 complete (reliability + persistence)
 
 **Implemented (Phase 1):**
 - Profile loader (`profiles.py`) — YAML → Pydantic models, CLI-arg builder
@@ -49,6 +49,14 @@ Target: Windows, single NVIDIA GPU, llama.cpp prebuilt CUDA binaries.
 - `/v1/completions` endpoint — prompt-based text completions; `CompletionRequest` model in `main.py`; `endpoint_path` parameter added to both proxy functions
 - Backend health checking — `BackendRouter` expanded with `_health` dict, periodic `/health` polling via `_poll_loop()`, `pick()` filters unhealthy backends (falls back to full list if all down); configurable via `BACKEND_HEALTH_INTERVAL`
 
+**Implemented (Phase 6 — reliability + persistence):**
+- Mid-stream error surfacing — `proxy.py` `_gen()` now catches `httpx.ReadError`/`RemoteProtocolError` mid-stream and injects a `data: {"error": ...}` SSE sentinel before closing, so clients can detect connection loss
+- Metrics JSON snapshot — `metrics.py`: `save_to_file()` / `load_from_file()` (atomic rename); `main.py`: `_metrics_snapshot_loop()` background task + load on startup + save on shutdown; controlled by `ORCHESTRATOR_METRICS_SNAPSHOT_INTERVAL` (default 60 s; 0 = disabled); path = `{LOG_DIR}/metrics.json`
+- Per-request SQLite history — `db.py` (new): `MetricsDB` class backed by `aiosqlite`; `insert_request()` called fire-and-forget (`asyncio.create_task`) from both streaming (`_on_stream_finish`) and non-streaming (`finally`) paths in `chat_completions` and `completions`; path = `{LOG_DIR}/metrics.db`
+- `GET /metrics/history` — queries SQLite; `?hours=N&model=id` params; returns per-model aggregates for the look-back window
+- `config.py`: added `metrics_snapshot_interval`; `requirements.txt`: added `aiosqlite==0.20.0`; `.env.example`: added `ORCHESTRATOR_METRICS_SNAPSHOT_INTERVAL`
+- Version bumped to 0.6.0
+
 ---
 
 ## File map
@@ -57,7 +65,8 @@ Target: Windows, single NVIDIA GPU, llama.cpp prebuilt CUDA binaries.
 |------|---------|
 | `main.py` | FastAPI app, routes, `SessionMiddleware`, `BackendRouter`, lifespan, `OrcError` exception handler |
 | `config.py` | `Settings` (pydantic-settings), module-level `settings` singleton |
-| `metrics.py` | `MetricsStore` — in-process per-model and process-level counters |
+| `metrics.py` | `MetricsStore` — in-process per-model and process-level counters; JSON snapshot save/load |
+| `db.py` | `MetricsDB` — `aiosqlite`-backed per-request row store; `query_history()` |
 | `profiles.py` | `ModelProfile`, `BackendEntry`, `ProfilesFile`, `load_profiles()`, `build_cli_args()` |
 | `process_manager.py` | `ChildState` enum, `OrcError` exception, `ChildInfo` dataclass, `ProcessManager` class |
 | `proxy.py` | `classify_stderr()`, `proxy_chat_completions()`, `proxy_chat_completions_stream()` |
@@ -117,7 +126,8 @@ All prefixed `ORCHESTRATOR_`. See `.env.example` for full list.
 - `CORS_ORIGINS` — comma-separated allowed origins, or `*`; empty = disabled
 - `PRELOAD_MODEL` — model ID to pre-load on startup; empty = no preload
 - `BACKEND_HEALTH_INTERVAL` — health poll interval for remote backends in seconds; 0 = disabled (default 30)
-- `LOG_DIR` — directory for rolling log files (default `logs`)
+- `LOG_DIR` — directory for rolling log files, JSON snapshot, and SQLite DB (default `logs`)
+- `METRICS_SNAPSHOT_INTERVAL` — seconds between JSON snapshot saves; 0 = disabled (default 60)
 
 ---
 
@@ -132,6 +142,7 @@ All prefixed `ORCHESTRATOR_`. See `.env.example` for full list.
 | POST | `/v1/completions` | Prompt-based text completions |
 | GET | `/metrics` | Per-model + process-level counters (JSON) |
 | GET | `/metrics/prometheus` | Same counters in Prometheus exposition format |
+| GET | `/metrics/history` | SQLite per-request history; `?hours=N&model=id` |
 | POST | `/admin/load` | Pre-load model; requires `X-Admin-Key` |
 | POST | `/admin/unload` | Unload model; requires `X-Admin-Key` |
 | POST | `/admin/reload-profiles` | Re-read `profiles.yaml` from disk; requires `X-Admin-Key` |
@@ -152,7 +163,7 @@ All prefixed `ORCHESTRATOR_`. See `.env.example` for full list.
 
 ## Development branch
 
-`claude/review-docs-improvements-vNmMT`
+`claude/plan-unimplemented-features-zwRf6`
 
 ---
 
@@ -208,3 +219,15 @@ All prefixed `ORCHESTRATOR_`. See `.env.example` for full list.
 - **M2: Backend health checking** — `main.py`: `BackendRouter` expanded with `_health` dict, `register_backends()`, `start_polling()`/`stop_polling()`, `_poll_loop()`/`_check_all()`; `pick()` filters unhealthy, falls back if all down; `config.py`: added `backend_health_interval`; `.env.example`: added `ORCHESTRATOR_BACKEND_HEALTH_INTERVAL`
 - Version bumped to 0.5.0
 - Updated README and CLAUDE.md: new endpoints, env vars, removed 2 known limitations (streaming tokens, health checking), added test suite and future plans sections
+
+### 2026-04-11 (session 6)
+- Phase 6 complete — reliability + persistence
+- **Streaming mid-stream errors** — `proxy.py` `_gen()` except block now captures `_stderr()`, logs, then `yield`s a `data: {"error": ...}` SSE sentinel before the `finally` cleanup so clients can detect mid-stream child death
+- **Metrics JSON snapshot** — `metrics.py`: added `save_to_file()` (atomic `os.replace`) and `load_from_file()` (silent on missing/corrupt); `main.py`: `_metrics_snapshot_loop()` background task, load on startup + save on shutdown, guarded by `metrics_snapshot_interval > 0`; path derived as `{log_dir}/metrics.json`
+- **SQLite per-request history** — `db.py` (new file): `MetricsDB` backed by `aiosqlite`; schema: `requests` table with indices on `ts` and `model`; `insert_request()` called via `asyncio.create_task()` (fire-and-forget) from `_on_stream_finish` and non-streaming `finally` in both `chat_completions` and `completions`; path derived as `{log_dir}/metrics.db`
+- **`GET /metrics/history`** — new endpoint; delegates to `MetricsDB.query_history(hours, model)`; returns 503 if DB unavailable
+- `config.py`: added `metrics_snapshot_interval: int = Field(60)`
+- `requirements.txt`: added `aiosqlite==0.20.0`
+- `.env.example`: added `ORCHESTRATOR_METRICS_SNAPSHOT_INTERVAL`
+- Version bumped to 0.6.0
+- Updated README and CLAUDE.md: new file layout, endpoint, env var, metrics persistence section, updated known limitations (streaming limitation reframed, metrics persistence removed), updated future plans

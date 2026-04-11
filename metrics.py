@@ -1,3 +1,5 @@
+import json
+import os
 import time
 from dataclasses import dataclass, field
 
@@ -19,7 +21,9 @@ class MetricsStore:
     """In-process counters for requests and process-level events.
 
     All access is from the asyncio event loop — no locking needed.
-    Counters reset on orchestrator restart; persistence is not implemented.
+    Aggregate counters can be saved to / loaded from a JSON snapshot file so
+    they survive orchestrator restarts.  Per-request history is stored
+    separately in SQLite (see db.py).
     """
 
     def __init__(self) -> None:
@@ -58,6 +62,47 @@ class MetricsStore:
         self._kills += 1
         self._current_model = None
         self._current_model_loaded_at = None
+
+    # --- snapshot persistence (flat JSON for quick restart recovery) ---
+
+    def save_to_file(self, path: str) -> None:
+        """Write aggregate counters to *path* as JSON (atomic replace)."""
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        data = {
+            "models": {
+                mid: {
+                    "requests": m.requests,
+                    "prompt_tokens": m.prompt_tokens,
+                    "completion_tokens": m.completion_tokens,
+                    "errors": m.errors,
+                    "total_latency_ms": m.total_latency_ms,
+                }
+                for mid, m in self._models.items()
+            },
+            "spawns": self._spawns,
+            "kills": self._kills,
+        }
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=2)
+        os.replace(tmp, path)
+
+    def load_from_file(self, path: str) -> None:
+        """Restore aggregate counters from a JSON snapshot (silently skips if missing)."""
+        try:
+            with open(path, encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            return
+        for mid, vals in data.get("models", {}).items():
+            m = self._models.setdefault(mid, ModelMetrics())
+            m.requests = vals.get("requests", 0)
+            m.prompt_tokens = vals.get("prompt_tokens", 0)
+            m.completion_tokens = vals.get("completion_tokens", 0)
+            m.errors = vals.get("errors", 0)
+            m.total_latency_ms = vals.get("total_latency_ms", 0.0)
+        self._spawns = data.get("spawns", 0)
+        self._kills = data.get("kills", 0)
 
     # --- serialisation ---
 

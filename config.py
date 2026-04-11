@@ -35,5 +35,9 @@ class Settings(BaseSettings):
     # Logging
     log_dir: str = Field("logs")
 
+    # Metrics persistence
+    # Interval (seconds) between JSON snapshot saves; 0 = disabled (no save/load)
+    metrics_snapshot_interval: int = Field(60)
+
 
 settings = Settings()
