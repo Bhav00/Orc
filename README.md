@@ -91,6 +91,11 @@ cp .env.example .env
 
 At minimum set `ORCHESTRATOR_LLAMA_SERVER_BIN` to the full path of your `llama-server.exe`.
 
+> **First-run gotcha:** if `.env` does not exist, `pydantic-settings` silently falls back to the defaults baked into `config.py` — it does **not** error out. If a setting looks wrong after startup, confirm `.env` is actually present in the working directory (it is gitignored, so a fresh clone won't have it) and verify with:
+> ```
+> python -c "from config import settings; print(settings.llama_server_bin, settings.admin_key)"
+> ```
+
 ### 4. Run
 
 ```

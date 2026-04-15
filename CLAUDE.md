@@ -250,3 +250,10 @@ All prefixed `ORCHESTRATOR_`. See `.env.example` for full list.
 - `.env.example`: added `ORCHESTRATOR_SWAP_TIMEOUT_SECONDS` and `ORCHESTRATOR_SWAP_QUEUE_DEPTH`
 - Version bumped to 0.7.0
 - Updated README and CLAUDE.md: new endpoints, env vars, error types, future plans pruned
+
+### 2026-04-15 (session 8)
+- First-run setup pass — no Python code changes
+- Diagnosed user's report that `.env` wasn't being read: root cause was that `/home/user/Orc/.env` simply did not exist. `config.py` is already correct (`SettingsConfigDict(env_prefix="ORCHESTRATOR_", env_file=".env", env_file_encoding="utf-8")`); pydantic-settings silently falls back to class defaults when the env file is missing, which masked the real issue.
+- `README.md`: added a "First-run gotcha" callout under setup step 3 explaining the silent-fallback behavior and giving a `python -c "from config import settings; ..."` verification snippet.
+- `profiles.yaml.example`: refreshed the local-spawn examples to current-generation models — `gemma4-e2b`, `gemma4-e4b`, `qwen3.5-4b`, `qwen3.5-9b`; remote-backend example renamed to `qwen3.5-9b-remote`. Comments note that Gemma 4 E2B/E4B multimodal inputs require `llama-mtmd-cli` (which Orc does not wrap) and that Qwen 3.5 hybrid reasoning defaults to non-thinking mode.
+- User's local `.env` and `profiles.yaml` (both gitignored) created from the refreshed templates for this workstation.
