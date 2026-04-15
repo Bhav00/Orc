@@ -2,7 +2,7 @@
 # Copy to profiles.yaml and update model_path values for your machine.
 #
 # The "models" keys are the model IDs used in API requests:
-#   POST /v1/chat/completions  { "model": "qwen2.5-14b-q5", ... }
+#   POST /v1/chat/completions  { "model": "gemma4-e4b", ... }
 #
 # Two profile modes:
 #
@@ -19,17 +19,20 @@
 #   Any llama-server flag can go in the flags block; unknown flags are passed through and
 #   llama-server will report errors for invalid ones (captured in stderr_tail).
 #
-# sampling_defaults are documented here for reference but are NOT automatically
-# merged into requests. Clients must send their own sampling params.
+# sampling_defaults ARE auto-merged into each request; client-supplied params
+# take precedence (via setdefault, Phase 4 feature).
 #
 # estimated_vram_mb is a rough figure used for a pre-spawn sanity check only.
 # It does not represent actual VRAM measurement.
 
 models:
-  qwen2.5-14b-q5:
-    display_name: "Qwen2.5 14B Instruct (Q5_K_M)"
-    model_path: "C:/models/qwen2.5-14b-instruct-q5_k_m.gguf"
-    estimated_vram_mb: 12000
+  # --- Gemma 4 (Google, released 2026-04-02) ---
+  # E2B / E4B are the small on-device sizes. Both support multimodal input in
+  # llama-mtmd-cli, but llama-server (which Orc wraps) is text-only.
+  gemma4-e2b:
+    display_name: "Gemma 4 E2B Instruct"
+    model_path: "C:/models/gemma-4-E2B-it-Q4_K_M.gguf"
+    estimated_vram_mb: 5500
     flags:
       ctx_size: 8192
       n_gpu_layers: 99
@@ -38,16 +41,16 @@ models:
       cache_type_v: q8_0
       parallel: 1
     sampling_defaults:
-      temperature: 0.2
-      top_p: 0.9
+      temperature: 0.7
+      top_p: 0.95
     chat_template: null   # null = let llama-server auto-detect from the GGUF metadata
 
-  qwen2.5-7b-q6:
-    display_name: "Qwen2.5 7B Instruct (Q6_K)"
-    model_path: "C:/models/qwen2.5-7b-instruct-q6_k.gguf"
-    estimated_vram_mb: 7000
+  gemma4-e4b:
+    display_name: "Gemma 4 E4B Instruct"
+    model_path: "C:/models/gemma-4-E4B-it-Q4_K_M.gguf"
+    estimated_vram_mb: 9000
     flags:
-      ctx_size: 16384
+      ctx_size: 8192
       n_gpu_layers: 99
       flash_attn: true
       cache_type_k: q8_0
@@ -58,10 +61,46 @@ models:
       top_p: 0.95
     chat_template: null
 
+  # --- Qwen 3.5 (Alibaba, released 2026-03-02) ---
+  # Hybrid reasoning (thinking / non-thinking); reasoning is OFF by default and
+  # is toggled per-request via the Qwen chat-template convention.
+  # Native 256K context — ctx_size below is deliberately lower to bound KV cache.
+  qwen3.5-4b:
+    display_name: "Qwen3.5 4B"
+    model_path: "C:/models/qwen3.5-4b-instruct-q5_k_m.gguf"
+    estimated_vram_mb: 5000
+    flags:
+      ctx_size: 16384
+      n_gpu_layers: 99
+      flash_attn: true
+      cache_type_k: q8_0
+      cache_type_v: q8_0
+      parallel: 1
+    sampling_defaults:
+      temperature: 0.7
+      top_p: 0.8
+    chat_template: null
+
+  qwen3.5-9b:
+    display_name: "Qwen3.5 9B"
+    model_path: "C:/models/qwen3.5-9b-instruct-q5_k_m.gguf"
+    estimated_vram_mb: 8500
+    flags:
+      ctx_size: 16384
+      n_gpu_layers: 99
+      flash_attn: true
+      cache_type_k: q8_0
+      cache_type_v: q8_0
+      parallel: 1
+    sampling_defaults:
+      temperature: 0.7
+      top_p: 0.8
+    chat_template: null
+
   # --- Remote backends example ---
   # Orc routes to these URLs round-robin. No local process is spawned.
-  # qwen2.5-14b-remote:
-  #   display_name: "Qwen2.5 14B (remote cluster)"
+  # qwen3.5-9b-remote:
+  #   display_name: "Qwen3.5 9B (remote cluster)"
   #   backends:
   #     - url: "http://10.0.0.1:8090"
   #     - url: "http://10.0.0.2:8090"
