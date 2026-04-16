@@ -195,6 +195,75 @@ print(resp.json()["choices"][0]["message"]["content"])
 > more vision tokens than a 512×512 one. Also ensure `n_gpu_layers: 99` and
 > `flash_attn: true` in your profile flags for full GPU offload.
 
+### Async usage
+
+If you need to call the API from an async function (e.g. inside a FastAPI route, Discord bot, etc.):
+
+```python
+import httpx
+
+async def chat(prompt: str) -> str:
+    async with httpx.AsyncClient(timeout=None) as client:
+        resp = await client.post("http://127.0.0.1:8080/v1/chat/completions", json={
+            "model": "my-model-id",
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": 256,
+        })
+        return resp.json()["choices"][0]["message"]["content"]
+```
+
+Async streaming:
+
+```python
+import httpx
+import json
+
+async def chat_stream(prompt: str):
+    async with httpx.AsyncClient(timeout=None) as client:
+        async with client.stream(
+            "POST",
+            "http://127.0.0.1:8080/v1/chat/completions",
+            json={
+                "model": "my-model-id",
+                "messages": [{"role": "user", "content": prompt}],
+                "stream": True,
+            },
+        ) as resp:
+            async for line in resp.aiter_lines():
+                if line.startswith("data: ") and line != "data: [DONE]":
+                    chunk = json.loads(line[6:])
+                    content = chunk["choices"][0]["delta"].get("content")
+                    if content:
+                        print(content, end="", flush=True)
+    print()
+```
+
+### Per-request parameters
+
+Orc forwards the full request body to llama-server as-is (`extra="allow"` on the request model). Any parameter below can be included in the request JSON alongside `model` and `messages`:
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `max_tokens` | `int` | Max tokens to generate |
+| `temperature` | `float` | Randomness (0.0 = greedy, 2.0 = max) |
+| `top_p` | `float` | Nucleus sampling threshold |
+| `top_k` | `int` | Top-K sampling |
+| `min_p` | `float` | Min-P sampling threshold |
+| `repeat_penalty` | `float` | Repetition penalty (1.0 = off) |
+| `presence_penalty` | `float` | OpenAI-style presence penalty |
+| `frequency_penalty` | `float` | OpenAI-style frequency penalty |
+| `seed` | `int` | RNG seed (-1 = random) |
+| `stop` | `list[str]` | Stop sequences |
+| `response_format` | `object` | `{"type": "json_object"}` for JSON mode |
+| `grammar` | `string` | GBNF grammar for constrained output |
+| `json_schema` | `object` | JSON schema for structured output |
+
+Any of these can also go in a profile's `sampling_defaults` to set per-model defaults — request-level values always take precedence.
+
+> **Note:** `ctx_size` is a llama-server CLI flag set at spawn time, not a
+> per-request parameter. Set it in the profile's `flags` or change it at
+> runtime via `POST /admin/custom_run` (which respawns the server).
+
 ---
 
 ## Endpoints
