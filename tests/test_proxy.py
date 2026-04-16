@@ -3,7 +3,7 @@ import httpx
 import respx
 
 from process_manager import OrcError
-from proxy import classify_stderr, proxy_chat_completions, proxy_chat_completions_stream
+from proxy import classify_stderr, detect_repetition, proxy_chat_completions, proxy_chat_completions_stream
 
 
 # ---------------------------------------------------------------------------
@@ -184,10 +184,10 @@ class TestProxyChatCompletionsStream:
 class TestStreamingUsageExtraction:
     @pytest.mark.asyncio
     @respx.mock
-    async def test_on_finish_receives_token_counts(self):
+    async def test_on_finish_receives_token_counts_and_finish_reason(self):
         sse_body = (
             'data: {"choices":[{"delta":{"content":"Hi"}}]}\n\n'
-            'data: {"choices":[{"delta":{"content":"!"}}],"usage":{"prompt_tokens":10,"completion_tokens":2}}\n\n'
+            'data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":2}}\n\n'
             "data: [DONE]\n\n"
         )
         respx.post("http://localhost:8090/v1/chat/completions").respond(
@@ -197,21 +197,22 @@ class TestStreamingUsageExtraction:
         )
         received = {}
 
-        def on_finish(pt, ct):
+        def on_finish(pt, ct, fr):
             received["prompt_tokens"] = pt
             received["completion_tokens"] = ct
+            received["finish_reason"] = fr
 
         gen = await proxy_chat_completions_stream(
             request_body={"model": "test", "messages": [], "stream": True},
             target_url="http://localhost:8090",
             on_finish=on_finish,
         )
-        # Consume the generator
         async for _ in gen:
             pass
 
         assert received["prompt_tokens"] == 10
         assert received["completion_tokens"] == 2
+        assert received["finish_reason"] == "stop"
 
     @pytest.mark.asyncio
     @respx.mock
@@ -227,9 +228,10 @@ class TestStreamingUsageExtraction:
         )
         received = {}
 
-        def on_finish(pt, ct):
+        def on_finish(pt, ct, fr):
             received["prompt_tokens"] = pt
             received["completion_tokens"] = ct
+            received["finish_reason"] = fr
 
         gen = await proxy_chat_completions_stream(
             request_body={"model": "test", "messages": [], "stream": True},
@@ -241,6 +243,7 @@ class TestStreamingUsageExtraction:
 
         assert received["prompt_tokens"] == 0
         assert received["completion_tokens"] == 0
+        assert received["finish_reason"] is None
 
     @pytest.mark.asyncio
     @respx.mock
@@ -259,3 +262,148 @@ class TestStreamingUsageExtraction:
         # Should not raise — on_finish is None
         async for _ in gen:
             pass
+
+
+# ---------------------------------------------------------------------------
+# detect_repetition
+# ---------------------------------------------------------------------------
+
+class TestDetectRepetition:
+    def test_no_repetition(self):
+        assert detect_repetition("The quick brown fox jumps over the lazy dog.") is None
+
+    def test_short_text_no_false_positive(self):
+        assert detect_repetition("abc", threshold=4, min_len=10) is None
+
+    def test_repeated_phrase(self):
+        pattern = "I hope this helps! "
+        text = pattern * 5
+        result = detect_repetition(text, threshold=4, min_len=10)
+        assert result is not None
+
+    def test_threshold_not_met(self):
+        pattern = "Hello world! "
+        text = pattern * 3
+        assert detect_repetition(text, threshold=4, min_len=10) is None
+
+    def test_short_pattern_below_min_len(self):
+        text = "ab" * 3
+        assert detect_repetition(text, threshold=4, min_len=10) is None
+
+    def test_exact_threshold(self):
+        pattern = "repeating phrase "
+        text = pattern * 4
+        result = detect_repetition(text, threshold=4, min_len=10)
+        assert result is not None
+
+
+# ---------------------------------------------------------------------------
+# Streaming repetition detection
+# ---------------------------------------------------------------------------
+
+class TestStreamingRepetitionDetection:
+    @pytest.mark.asyncio
+    @respx.mock
+    async def test_repetition_abort(self):
+        """When repetition is detected and action=abort, stream should end with error SSE."""
+        repeated = "I hope this helps! "
+        # Build enough SSE chunks to trigger detection (check runs every 20 chunks)
+        chunks = []
+        for i in range(25):
+            chunk = f'data: {{"choices":[{{"delta":{{"content":"{repeated}"}}}}]}}\n\n'
+            chunks.append(chunk)
+        chunks.append("data: [DONE]\n\n")
+        sse_body = "".join(chunks)
+
+        respx.post("http://localhost:8090/v1/chat/completions").respond(
+            200,
+            content=sse_body.encode(),
+            headers={"content-type": "text/event-stream"},
+        )
+
+        collected = []
+        gen = await proxy_chat_completions_stream(
+            request_body={"model": "test", "messages": [], "stream": True},
+            target_url="http://localhost:8090",
+            repeat_window=200,
+            repeat_threshold=4,
+            repeat_action="abort",
+        )
+        async for chunk in gen:
+            collected.append(chunk.decode("utf-8", errors="replace"))
+
+        combined = "".join(collected)
+        assert "repetition_detected" in combined
+
+    @pytest.mark.asyncio
+    @respx.mock
+    async def test_repetition_warn_continues(self):
+        """When action=warn, stream should continue even after repetition."""
+        repeated = "I hope this helps! "
+        chunks = []
+        for i in range(25):
+            chunk = f'data: {{"choices":[{{"delta":{{"content":"{repeated}"}}}}]}}\n\n'
+            chunks.append(chunk)
+        chunks.append('data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":25}}\n\n')
+        chunks.append("data: [DONE]\n\n")
+        sse_body = "".join(chunks)
+
+        respx.post("http://localhost:8090/v1/chat/completions").respond(
+            200,
+            content=sse_body.encode(),
+            headers={"content-type": "text/event-stream"},
+        )
+
+        received = {}
+
+        def on_finish(pt, ct, fr):
+            received["prompt_tokens"] = pt
+            received["completion_tokens"] = ct
+
+        gen = await proxy_chat_completions_stream(
+            request_body={"model": "test", "messages": [], "stream": True},
+            target_url="http://localhost:8090",
+            on_finish=on_finish,
+            repeat_window=200,
+            repeat_threshold=4,
+            repeat_action="warn",
+        )
+        collected = []
+        async for chunk in gen:
+            collected.append(chunk.decode("utf-8", errors="replace"))
+
+        combined = "".join(collected)
+        # Should NOT contain error sentinel
+        assert "repetition_detected" not in combined
+        # on_finish should still be called with token counts
+        assert received["prompt_tokens"] == 5
+
+    @pytest.mark.asyncio
+    @respx.mock
+    async def test_no_detection_when_disabled(self):
+        """With repeat_window=0, no detection should occur."""
+        repeated = "I hope this helps! "
+        chunks = []
+        for i in range(25):
+            chunk = f'data: {{"choices":[{{"delta":{{"content":"{repeated}"}}}}]}}\n\n'
+            chunks.append(chunk)
+        chunks.append("data: [DONE]\n\n")
+        sse_body = "".join(chunks)
+
+        respx.post("http://localhost:8090/v1/chat/completions").respond(
+            200,
+            content=sse_body.encode(),
+            headers={"content-type": "text/event-stream"},
+        )
+
+        gen = await proxy_chat_completions_stream(
+            request_body={"model": "test", "messages": [], "stream": True},
+            target_url="http://localhost:8090",
+            repeat_window=0,
+        )
+        collected = []
+        async for chunk in gen:
+            collected.append(chunk.decode("utf-8", errors="replace"))
+
+        combined = "".join(collected)
+        assert "repetition_detected" not in combined

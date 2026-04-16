@@ -11,6 +11,8 @@ class ModelMetrics:
     completion_tokens: int = 0
     errors: int = 0
     total_latency_ms: float = 0.0
+    empty_responses: int = 0
+    finish_reason_counts: dict[str, int] = field(default_factory=dict)
 
     @property
     def avg_latency_ms(self) -> float:
@@ -42,6 +44,7 @@ class MetricsStore:
         prompt_tokens: int = 0,
         completion_tokens: int = 0,
         error: bool = False,
+        finish_reason: str | None = None,
     ) -> None:
         m = self._models.setdefault(model_id, ModelMetrics())
         m.requests += 1
@@ -50,6 +53,10 @@ class MetricsStore:
         m.completion_tokens += completion_tokens
         if error:
             m.errors += 1
+        if completion_tokens == 0 and not error:
+            m.empty_responses += 1
+        if finish_reason is not None:
+            m.finish_reason_counts[finish_reason] = m.finish_reason_counts.get(finish_reason, 0) + 1
 
     # --- process-level (called by ProcessManager) ---
 
@@ -76,6 +83,8 @@ class MetricsStore:
                     "completion_tokens": m.completion_tokens,
                     "errors": m.errors,
                     "total_latency_ms": m.total_latency_ms,
+                    "empty_responses": m.empty_responses,
+                    "finish_reason_counts": m.finish_reason_counts,
                 }
                 for mid, m in self._models.items()
             },
@@ -101,6 +110,8 @@ class MetricsStore:
             m.completion_tokens = vals.get("completion_tokens", 0)
             m.errors = vals.get("errors", 0)
             m.total_latency_ms = vals.get("total_latency_ms", 0.0)
+            m.empty_responses = vals.get("empty_responses", 0)
+            m.finish_reason_counts = vals.get("finish_reason_counts", {})
         self._spawns = data.get("spawns", 0)
         self._kills = data.get("kills", 0)
 
@@ -129,6 +140,17 @@ class MetricsStore:
         lines.append("# TYPE orc_model_errors_total counter")
         for mid, m in self._models.items():
             lines.append(f'orc_model_errors_total{{model="{mid}"}} {m.errors}')
+
+        lines.append("# HELP orc_model_empty_responses_total Total empty responses per model.")
+        lines.append("# TYPE orc_model_empty_responses_total counter")
+        for mid, m in self._models.items():
+            lines.append(f'orc_model_empty_responses_total{{model="{mid}"}} {m.empty_responses}')
+
+        lines.append("# HELP orc_model_finish_reason_total Finish reason counts per model.")
+        lines.append("# TYPE orc_model_finish_reason_total counter")
+        for mid, m in self._models.items():
+            for reason, count in m.finish_reason_counts.items():
+                lines.append(f'orc_model_finish_reason_total{{model="{mid}",reason="{reason}"}} {count}')
 
         lines.append("# HELP orc_model_avg_latency_ms Average request latency per model.")
         lines.append("# TYPE orc_model_avg_latency_ms gauge")
@@ -165,6 +187,8 @@ class MetricsStore:
                     "prompt_tokens": m.prompt_tokens,
                     "completion_tokens": m.completion_tokens,
                     "errors": m.errors,
+                    "empty_responses": m.empty_responses,
+                    "finish_reasons": m.finish_reason_counts,
                     "avg_latency_ms": m.avg_latency_ms,
                 }
                 for mid, m in self._models.items()

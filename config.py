@@ -48,5 +48,14 @@ class Settings(BaseSettings):
     # 0 = unlimited.
     swap_queue_depth: int = Field(0)
 
+    # Repetition detection — sliding-window character-level detector.
+    # Window size in characters (0 = detection disabled entirely).
+    repeat_detection_window: int = Field(0)
+    # Number of consecutive repeats of the same pattern to trigger detection.
+    repeat_detection_threshold: int = Field(4)
+    # Action on detection: "abort" = inject error SSE and stop stream;
+    # "warn" = log only, let response pass through.
+    repeat_detection_action: str = Field("abort")
+
 
 settings = Settings()

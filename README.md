@@ -394,6 +394,21 @@ The `stderr_tail` array contains the last lines emitted to `llama-server` stderr
 | `custom_run` on a remote-backend profile | 400 | `unsupported_operation` |
 | Timed out waiting for model swap lock | 503 + `Retry-After: 5` | `swap_timeout` |
 | Swap queue is full (`SWAP_QUEUE_DEPTH` limit reached) | 503 + `Retry-After: 5` | `swap_queue_full` |
+| Repetition loop detected mid-stream (abort mode) | 200 (SSE sentinel) | `repetition_detected` |
+
+---
+
+## Output quality safeguards
+
+Orc includes several layers of protection against degenerate LLM output:
+
+1. **Sampling defaults** — Profiles can set `repeat_penalty` and `max_tokens` in `sampling_defaults`. These are merged into every request (client-supplied params take precedence).
+
+2. **finish_reason tracking** — Extracted from every response (streaming and non-streaming) and logged to `requests.jsonl`, SQLite DB, and in-memory metrics. Check `GET /metrics` for `finish_reasons` distribution per model.
+
+3. **Empty response detection** — When `completion_tokens == 0`, Orc logs a warning and returns an `X-Orc-Warning: empty-response` header on non-streaming responses. When `finish_reason == "length"`, the header is `X-Orc-Warning: generation-truncated`.
+
+4. **Repetition detection** — When `REPEAT_DETECTION_WINDOW` > 0, Orc runs a sliding-window character-level detector on streamed content deltas. If a pattern repeats `REPEAT_DETECTION_THRESHOLD` times, the configured action fires: `abort` injects an error SSE sentinel and closes the stream; `warn` logs but continues. For non-streaming responses, the same detection runs post-hoc and adds an `X-Orc-Warning: repetition-detected` header.
 
 ---
 
@@ -494,6 +509,9 @@ All variables are prefixed `ORCHESTRATOR_`. Defaults are shown.
 | `METRICS_SNAPSHOT_INTERVAL` | `60` | Seconds between JSON snapshot saves; 0 = disabled (no save/load) |
 | `SWAP_TIMEOUT_SECONDS` | `30` | Max seconds to wait for model swap lock before returning 503; 0 = wait indefinitely |
 | `SWAP_QUEUE_DEPTH` | `0` | Max requests queued for a model swap; excess requests rejected immediately; 0 = unlimited |
+| `REPEAT_DETECTION_WINDOW` | `0` | Sliding-window size in characters for repetition detection; 0 = disabled |
+| `REPEAT_DETECTION_THRESHOLD` | `4` | Number of consecutive repeats of the same pattern to trigger detection |
+| `REPEAT_DETECTION_ACTION` | `abort` | Action on detection: `abort` = inject error SSE and stop stream; `warn` = log only |
 
 ---
 

@@ -21,7 +21,7 @@ from db import MetricsDB
 from metrics import MetricsStore
 from process_manager import OrcError, ProcessManager
 from profiles import BackendEntry, load_profiles
-from proxy import proxy_chat_completions, proxy_chat_completions_stream
+from proxy import detect_repetition, proxy_chat_completions, proxy_chat_completions_stream
 
 logging.basicConfig(
     level=logging.INFO,
@@ -267,7 +267,7 @@ async def lifespan(app: FastAPI):
 # App
 # ---------------------------------------------------------------------------
 
-app = FastAPI(title="Orc", version="0.7.0", lifespan=lifespan)
+app = FastAPI(title="Orc", version="0.8.0", lifespan=lifespan)
 app.add_middleware(SessionMiddleware)
 
 if settings.cors_origins:
@@ -359,6 +359,7 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
     t0 = time.monotonic()
 
     prompt_tokens = completion_tokens = 0
+    finish_reason: str | None = None
     http_status = 200
     had_error = False
 
@@ -385,7 +386,7 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
                 body_dict.setdefault(key, value)
 
         if body.stream:
-            def _on_stream_finish(pt: int, ct: int) -> None:
+            def _on_stream_finish(pt: int, ct: int, fr: str | None) -> None:
                 latency_ms = (time.monotonic() - t0) * 1000
                 metrics.record_request(
                     model_id=body.model,
@@ -393,7 +394,10 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
                     prompt_tokens=pt,
                     completion_tokens=ct,
                     error=False,
+                    finish_reason=fr,
                 )
+                if ct == 0:
+                    log.warning("Empty streaming response for model=%s finish_reason=%s", body.model, fr)
                 req_log.info(
                     json.dumps({
                         "session_id": session_id,
@@ -403,6 +407,7 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
                         "status": 200,
                         "prompt_tokens": pt,
                         "completion_tokens": ct,
+                        "finish_reason": fr,
                     })
                 )
                 if db is not None:
@@ -410,6 +415,7 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
                         session_id=session_id, model=body.model, stream=True,
                         latency_ms=latency_ms, status=200,
                         prompt_tokens=pt, completion_tokens=ct, error=False,
+                        finish_reason=fr,
                     ))
 
             gen = await proxy_chat_completions_stream(
@@ -417,6 +423,9 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
                 target_url=target_url,
                 process_manager=pm_for_proxy,
                 on_finish=_on_stream_finish,
+                repeat_window=settings.repeat_detection_window,
+                repeat_threshold=settings.repeat_detection_threshold,
+                repeat_action=settings.repeat_detection_action,
             )
             return StreamingResponse(gen, media_type="text/event-stream")
 
@@ -426,8 +435,32 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
             process_manager=pm_for_proxy,
         )
         usage = result.get("usage") or {}
+        choices = result.get("choices") or []
+        finish_reason = choices[0].get("finish_reason") if choices else None
         prompt_tokens = usage.get("prompt_tokens", 0)
         completion_tokens = usage.get("completion_tokens", 0)
+
+        headers: dict[str, str] = {}
+        if completion_tokens == 0:
+            headers["X-Orc-Warning"] = "empty-response"
+        elif finish_reason == "length":
+            headers["X-Orc-Warning"] = "generation-truncated"
+
+        if settings.repeat_detection_window > 0:
+            content = ""
+            if choices:
+                content = (choices[0].get("message") or {}).get("content", "")
+            if content:
+                pat = detect_repetition(
+                    content[-settings.repeat_detection_window:],
+                    settings.repeat_detection_threshold,
+                )
+                if pat:
+                    log.warning("Repetition detected in response: pattern=%r", pat[:80])
+                    headers["X-Orc-Warning"] = "repetition-detected"
+
+        if headers:
+            return JSONResponse(content=result, headers=headers)
         return result
 
     except OrcError as exc:
@@ -445,6 +478,7 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
                 prompt_tokens=prompt_tokens,
                 completion_tokens=completion_tokens,
                 error=had_error,
+                finish_reason=finish_reason,
             )
             req_log.info(
                 json.dumps({
@@ -455,6 +489,7 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
                     "status": http_status,
                     "prompt_tokens": prompt_tokens,
                     "completion_tokens": completion_tokens,
+                    "finish_reason": finish_reason,
                 })
             )
             if db is not None:
@@ -462,7 +497,7 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
                     session_id=session_id, model=body.model, stream=False,
                     latency_ms=latency_ms, status=http_status,
                     prompt_tokens=prompt_tokens, completion_tokens=completion_tokens,
-                    error=had_error,
+                    error=had_error, finish_reason=finish_reason,
                 ))
 
 
@@ -477,6 +512,7 @@ async def completions(body: CompletionRequest, request: Request):
     t0 = time.monotonic()
 
     prompt_tokens = completion_tokens = 0
+    finish_reason: str | None = None
     http_status = 200
     had_error = False
 
@@ -500,22 +536,27 @@ async def completions(body: CompletionRequest, request: Request):
                 body_dict.setdefault(key, value)
 
         if body.stream:
-            def _on_stream_finish(pt: int, ct: int) -> None:
+            def _on_stream_finish(pt: int, ct: int, fr: str | None) -> None:
                 latency_ms = (time.monotonic() - t0) * 1000
                 metrics.record_request(
                     model_id=body.model, latency_ms=latency_ms,
                     prompt_tokens=pt, completion_tokens=ct, error=False,
+                    finish_reason=fr,
                 )
+                if ct == 0:
+                    log.warning("Empty streaming response for model=%s finish_reason=%s", body.model, fr)
                 req_log.info(json.dumps({
                     "session_id": session_id, "model": body.model,
                     "stream": True, "latency_ms": round(latency_ms, 1),
                     "status": 200, "prompt_tokens": pt, "completion_tokens": ct,
+                    "finish_reason": fr,
                 }))
                 if db is not None:
                     asyncio.create_task(db.insert_request(
                         session_id=session_id, model=body.model, stream=True,
                         latency_ms=latency_ms, status=200,
                         prompt_tokens=pt, completion_tokens=ct, error=False,
+                        finish_reason=fr,
                     ))
 
             gen = await proxy_chat_completions_stream(
@@ -523,6 +564,9 @@ async def completions(body: CompletionRequest, request: Request):
                 process_manager=pm_for_proxy,
                 endpoint_path="/v1/completions",
                 on_finish=_on_stream_finish,
+                repeat_window=settings.repeat_detection_window,
+                repeat_threshold=settings.repeat_detection_threshold,
+                repeat_action=settings.repeat_detection_action,
             )
             return StreamingResponse(gen, media_type="text/event-stream")
 
@@ -532,8 +576,32 @@ async def completions(body: CompletionRequest, request: Request):
             endpoint_path="/v1/completions",
         )
         usage = result.get("usage") or {}
+        choices = result.get("choices") or []
+        finish_reason = choices[0].get("finish_reason") if choices else None
         prompt_tokens = usage.get("prompt_tokens", 0)
         completion_tokens = usage.get("completion_tokens", 0)
+
+        headers: dict[str, str] = {}
+        if completion_tokens == 0:
+            headers["X-Orc-Warning"] = "empty-response"
+        elif finish_reason == "length":
+            headers["X-Orc-Warning"] = "generation-truncated"
+
+        if settings.repeat_detection_window > 0:
+            content = ""
+            if choices:
+                content = choices[0].get("text", "")
+            if content:
+                pat = detect_repetition(
+                    content[-settings.repeat_detection_window:],
+                    settings.repeat_detection_threshold,
+                )
+                if pat:
+                    log.warning("Repetition detected in response: pattern=%r", pat[:80])
+                    headers["X-Orc-Warning"] = "repetition-detected"
+
+        if headers:
+            return JSONResponse(content=result, headers=headers)
         return result
 
     except OrcError as exc:
@@ -547,20 +615,21 @@ async def completions(body: CompletionRequest, request: Request):
             metrics.record_request(
                 model_id=body.model, latency_ms=latency_ms,
                 prompt_tokens=prompt_tokens, completion_tokens=completion_tokens,
-                error=had_error,
+                error=had_error, finish_reason=finish_reason,
             )
             req_log.info(json.dumps({
                 "session_id": session_id, "model": body.model,
                 "stream": False, "latency_ms": round(latency_ms, 1),
                 "status": http_status, "prompt_tokens": prompt_tokens,
                 "completion_tokens": completion_tokens,
+                "finish_reason": finish_reason,
             }))
             if db is not None:
                 asyncio.create_task(db.insert_request(
                     session_id=session_id, model=body.model, stream=False,
                     latency_ms=latency_ms, status=http_status,
                     prompt_tokens=prompt_tokens, completion_tokens=completion_tokens,
-                    error=had_error,
+                    error=had_error, finish_reason=finish_reason,
                 ))
 
 
