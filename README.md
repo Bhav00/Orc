@@ -110,6 +110,93 @@ uvicorn main:app --host 127.0.0.1 --port 8080
 
 ---
 
+## API usage examples (Python)
+
+### Text chat
+
+```python
+import requests
+
+resp = requests.post("http://127.0.0.1:8080/v1/chat/completions", json={
+    "model": "my-model-id",
+    "messages": [
+        {"role": "system", "content": "You are a helpful assistant."},
+        {"role": "user", "content": "What is the capital of France?"},
+    ],
+})
+
+print(resp.json()["choices"][0]["message"]["content"])
+```
+
+### Streaming chat
+
+```python
+import httpx
+import json
+
+with httpx.Client(timeout=None) as client:
+    with client.stream(
+        "POST",
+        "http://127.0.0.1:8080/v1/chat/completions",
+        json={
+            "model": "my-model-id",
+            "messages": [{"role": "user", "content": "Write a haiku about coding."}],
+            "stream": True,
+        },
+    ) as resp:
+        for line in resp.iter_lines():
+            if line.startswith("data: ") and line != "data: [DONE]":
+                chunk = json.loads(line[6:])
+                content = chunk["choices"][0]["delta"].get("content")
+                if content:
+                    print(content, end="", flush=True)
+print()
+```
+
+> **Note:** Use `httpx` (already in `requirements.txt`) rather than `requests`
+> for streaming — `requests.iter_lines()` buffers and tokens arrive in batches
+> instead of one-by-one. The first SSE chunk often has `content: null` (just
+> the `role` field), so always guard with `if content:`.
+
+### Image / VLM chat
+
+Requires the model to be loaded with an mmproj file (see Planned improvements).
+
+```python
+import base64
+import io
+import requests
+from PIL import Image
+
+# Resize to reduce vision token count and speed up inference
+img = Image.open("photo.png")
+img.thumbnail((512, 512))
+buf = io.BytesIO()
+img.save(buf, format="PNG")
+b64 = base64.b64encode(buf.getvalue()).decode()
+
+resp = requests.post("http://127.0.0.1:8080/v1/chat/completions", json={
+    "model": "my-vlm-id",
+    "messages": [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "What do you see in this image?"},
+                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}},
+            ],
+        }
+    ],
+})
+
+print(resp.json()["choices"][0]["message"]["content"])
+```
+
+> **Performance tip:** Shrink images before sending — a 4K image produces far
+> more vision tokens than a 512×512 one. Also ensure `n_gpu_layers: 99` and
+> `flash_attn: true` in your profile flags for full GPU offload.
+
+---
+
 ## Endpoints
 
 | Method | Path | Description |
@@ -364,7 +451,20 @@ The test suite uses `pytest` with `pytest-asyncio` for async tests and `respx` f
 
 ---
 
-## Future plans
+## Planned improvements
 
-- **Multi-model on one GPU** — load multiple small models concurrently when VRAM allows
-- **SQLite DB housekeeping** — automatic pruning of old rows (e.g. keep last 30 days) to cap disk usage
+### Cleanup
+
+- **Remove stale `python-dotenv` dependency** — `python-dotenv==1.0.1` is in `requirements.txt` but never imported anywhere. `pydantic-settings` reads `.env` natively via `SettingsConfigDict(env_file=".env")` — no `load_dotenv()` needed. Safe to remove.
+
+### VLM / multimodal support
+
+- **First-class mmproj support** — add `mmproj_path: str | None = None` field to `ModelProfile` in `profiles.py`. In `process_manager.py` `_spawn()`, inject `["--mmproj", profile.mmproj_path]` when set (same pattern as the existing `chat_template` block). Without this, VLMs load but cannot process images.
+- **VLM example profile** — add a profile to `profiles.yaml.example` showing `mmproj_path` usage.
+- **Fix outdated "text-only" comment** — `profiles.yaml.example` says *"llama-server (which Orc wraps) is text-only"*. This was true historically but modern llama.cpp supports `--mmproj` in llama-server. Update the comment.
+- **VLM performance guidance** — document recommended flags for vision workloads: `n_gpu_layers: 99` (full GPU offload), `flash_attn: true`, `batch_size: 512`, smaller `ctx_size`, and client-side image resize to reduce vision token count.
+
+### Infrastructure
+
+- **Multi-model on one GPU** — load multiple small models concurrently when VRAM allows.
+- **SQLite DB housekeeping** — automatic pruning of old rows (e.g. keep last 30 days) to cap disk usage.
