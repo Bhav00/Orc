@@ -28,11 +28,16 @@ CREATE TABLE IF NOT EXISTS requests (
     status            INTEGER,
     prompt_tokens     INTEGER DEFAULT 0,
     completion_tokens INTEGER DEFAULT 0,
-    error             INTEGER NOT NULL DEFAULT 0
+    error             INTEGER NOT NULL DEFAULT 0,
+    finish_reason     TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_requests_ts    ON requests (ts);
 CREATE INDEX IF NOT EXISTS idx_requests_model ON requests (model);
 """
+
+_MIGRATE_SQL = [
+    "ALTER TABLE requests ADD COLUMN finish_reason TEXT",
+]
 
 
 class MetricsDB:
@@ -52,6 +57,11 @@ class MetricsDB:
         os.makedirs(os.path.dirname(os.path.abspath(self._path)), exist_ok=True)
         self._conn = await aiosqlite.connect(self._path)
         await self._conn.executescript(_CREATE_SQL)
+        for stmt in _MIGRATE_SQL:
+            try:
+                await self._conn.execute(stmt)
+            except Exception:
+                pass
         await self._conn.commit()
 
     async def close(self) -> None:
@@ -70,13 +80,15 @@ class MetricsDB:
         prompt_tokens: int,
         completion_tokens: int,
         error: bool,
+        finish_reason: str | None = None,
     ) -> None:
         if self._conn is None:
             return
         await self._conn.execute(
             "INSERT INTO requests "
-            "(ts, session_id, model, stream, latency_ms, status, prompt_tokens, completion_tokens, error) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "(ts, session_id, model, stream, latency_ms, status, "
+            "prompt_tokens, completion_tokens, error, finish_reason) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 int(time.time()),
                 session_id,
@@ -87,6 +99,7 @@ class MetricsDB:
                 prompt_tokens,
                 completion_tokens,
                 int(error),
+                finish_reason,
             ),
         )
         await self._conn.commit()
@@ -100,42 +113,50 @@ class MetricsDB:
 
         Returns:
             {"window_hours": N, "models": {model_id: {requests, prompt_tokens,
-             completion_tokens, errors, avg_latency_ms}}}
+             completion_tokens, errors, avg_latency_ms, finish_reasons: {...}}}}
         """
         if self._conn is None:
             return {"window_hours": hours, "models": {}}
 
         since = int(time.time()) - hours * 3600
+        where = "WHERE ts >= ?"
         params: tuple
         if model:
-            sql = (
-                "SELECT model, COUNT(*), "
-                "COALESCE(SUM(prompt_tokens),0), COALESCE(SUM(completion_tokens),0), "
-                "COALESCE(SUM(error),0), AVG(latency_ms) "
-                "FROM requests WHERE ts >= ? AND model = ? GROUP BY model"
-            )
+            where += " AND model = ?"
             params = (since, model)
         else:
-            sql = (
-                "SELECT model, COUNT(*), "
-                "COALESCE(SUM(prompt_tokens),0), COALESCE(SUM(completion_tokens),0), "
-                "COALESCE(SUM(error),0), AVG(latency_ms) "
-                "FROM requests WHERE ts >= ? GROUP BY model"
-            )
             params = (since,)
 
-        cur = await self._conn.execute(sql, params)
+        agg_sql = (
+            "SELECT model, COUNT(*), "
+            "COALESCE(SUM(prompt_tokens),0), COALESCE(SUM(completion_tokens),0), "
+            f"COALESCE(SUM(error),0), AVG(latency_ms) "
+            f"FROM requests {where} GROUP BY model"
+        )
+        cur = await self._conn.execute(agg_sql, params)
         rows = await cur.fetchall()
-        return {
-            "window_hours": hours,
-            "models": {
-                row[0]: {
-                    "requests": row[1],
-                    "prompt_tokens": row[2],
-                    "completion_tokens": row[3],
-                    "errors": row[4],
-                    "avg_latency_ms": round(row[5] or 0.0, 1),
-                }
-                for row in rows
-            },
-        }
+
+        models: dict[str, dict] = {}
+        for row in rows:
+            models[row[0]] = {
+                "requests": row[1],
+                "prompt_tokens": row[2],
+                "completion_tokens": row[3],
+                "errors": row[4],
+                "avg_latency_ms": round(row[5] or 0.0, 1),
+                "finish_reasons": {},
+            }
+
+        fr_sql = (
+            "SELECT model, finish_reason, COUNT(*) "
+            f"FROM requests {where} GROUP BY model, finish_reason"
+        )
+        cur = await self._conn.execute(fr_sql, params)
+        fr_rows = await cur.fetchall()
+        for row in fr_rows:
+            mid = row[0]
+            reason = row[1] or "null"
+            if mid in models:
+                models[mid]["finish_reasons"][reason] = row[2]
+
+        return {"window_hours": hours, "models": models}

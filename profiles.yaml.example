@@ -43,6 +43,8 @@ models:
     sampling_defaults:
       temperature: 0.7
       top_p: 0.95
+      repeat_penalty: 1.1
+      max_tokens: 2048
     chat_template: null   # null = let llama-server auto-detect from the GGUF metadata
 
   gemma4-e4b:
@@ -59,6 +61,8 @@ models:
     sampling_defaults:
       temperature: 0.7
       top_p: 0.95
+      repeat_penalty: 1.1
+      max_tokens: 2048
     chat_template: null
 
   # --- Qwen 3.5 (Alibaba, released 2026-03-02) ---
@@ -79,6 +83,8 @@ models:
     sampling_defaults:
       temperature: 0.7
       top_p: 0.8
+      repeat_penalty: 1.1
+      max_tokens: 2048
     chat_template: null
 
   qwen3.5-9b:
@@ -95,6 +101,8 @@ models:
     sampling_defaults:
       temperature: 0.7
       top_p: 0.8
+      repeat_penalty: 1.1
+      max_tokens: 2048
     chat_template: null
 
   # --- Remote backends example ---

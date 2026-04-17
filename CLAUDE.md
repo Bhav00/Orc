@@ -16,7 +16,7 @@ Target: Windows, single NVIDIA GPU, llama.cpp prebuilt CUDA binaries.
 
 ---
 
-## Current phase: Phase 7 complete (request queuing + force-unload)
+## Current phase: Phase 8 complete (LLM output quality safeguards)
 
 **Implemented (Phase 1):**
 - Profile loader (`profiles.py`) — YAML → Pydantic models, CLI-arg builder
@@ -63,6 +63,18 @@ Target: Windows, single NVIDIA GPU, llama.cpp prebuilt CUDA binaries.
 - `config.py`: added `swap_timeout_seconds: int = Field(30)` and `swap_queue_depth: int = Field(0)`
 - `.env.example`: added `ORCHESTRATOR_SWAP_TIMEOUT_SECONDS` and `ORCHESTRATOR_SWAP_QUEUE_DEPTH`
 - Version bumped to 0.7.0
+
+**Implemented (Phase 8 — LLM output quality safeguards):**
+- Sampling defaults — `profiles.yaml.example`: added `repeat_penalty: 1.1` and `max_tokens: 2048` to all profiles' `sampling_defaults`; merged into every request via existing `setdefault()` logic (client values always win)
+- finish_reason extraction — `proxy.py`: extracted from non-streaming responses and from the last SSE chunk in streaming; `on_finish` callback expanded to 3 args `(prompt_tokens, completion_tokens, finish_reason)`; logged in `requests.jsonl`, stored in SQLite, tracked in `MetricsStore`
+- Empty response detection — `proxy.py`: logs warning when `completion_tokens == 0` on HTTP 200; `main.py`: non-streaming responses with zero tokens get `X-Orc-Warning: empty-response` header; `finish_reason == "length"` gets `X-Orc-Warning: generation-truncated` header
+- Repetition detection — `proxy.py`: `detect_repetition()` function (sliding-window character-level pattern check); streaming `_gen()` runs detector every 20 chunks when `repeat_detection_window > 0`; `abort` mode injects `data: {"error": {..., "type": "repetition_detected"}}` SSE sentinel; `warn` mode logs only; non-streaming path checks post-hoc and adds `X-Orc-Warning: repetition-detected` header
+- `metrics.py`: added `empty_responses` and `finish_reason_counts` to `ModelMetrics`; updated `record_request()`, `to_dict()`, `to_prometheus()`, `save_to_file()`, `load_from_file()`
+- `db.py`: added `finish_reason TEXT` column to schema; `ALTER TABLE` migration for existing DBs; updated `insert_request()` and `query_history()` (includes finish_reason distribution)
+- `config.py`: added `repeat_detection_window`, `repeat_detection_threshold`, `repeat_detection_action`
+- `.env.example`: added `ORCHESTRATOR_REPEAT_DETECTION_WINDOW`, `ORCHESTRATOR_REPEAT_DETECTION_THRESHOLD`, `ORCHESTRATOR_REPEAT_DETECTION_ACTION`
+- Tests: 73 tests total (up from 56); new tests for `detect_repetition`, streaming repetition abort/warn/disabled, finish_reason extraction, empty response tracking, finish_reason metrics, snapshot round-trip
+- Version bumped to 0.8.0
 
 ---
 
@@ -173,7 +185,7 @@ All prefixed `ORCHESTRATOR_`. See `.env.example` for full list.
 
 ## Development branch
 
-`claude/plan-unimplemented-features-zwRf6`
+`claude/fix-llm-output-issues-M25Gf`
 
 ---
 
@@ -257,3 +269,17 @@ All prefixed `ORCHESTRATOR_`. See `.env.example` for full list.
 - `README.md`: added a "First-run gotcha" callout under setup step 3 explaining the silent-fallback behavior and giving a `python -c "from config import settings; ..."` verification snippet.
 - `profiles.yaml.example`: refreshed the local-spawn examples to current-generation models — `gemma4-e2b`, `gemma4-e4b`, `qwen3.5-4b`, `qwen3.5-9b`; remote-backend example renamed to `qwen3.5-9b-remote`. Comments note that Gemma 4 E2B/E4B multimodal inputs require `llama-mtmd-cli` (which Orc does not wrap) and that Qwen 3.5 hybrid reasoning defaults to non-thinking mode.
 - User's local `.env` and `profiles.yaml` (both gitignored) created from the refreshed templates for this workstation.
+
+### 2026-04-16 (session 9)
+- Phase 8 complete — LLM output quality safeguards
+- **Sampling defaults** — `profiles.yaml.example`: added `repeat_penalty: 1.1` and `max_tokens: 2048` to all four profiles' `sampling_defaults`
+- **finish_reason extraction** — `proxy.py`: parsed from non-streaming responses and from last SSE chunk in streaming; `on_finish` callback expanded to `(pt, ct, finish_reason)`; wired into all 4 handler paths in `main.py`
+- **Empty response detection** — `proxy.py`: warning log on `completion_tokens == 0`; `main.py`: `X-Orc-Warning: empty-response` and `X-Orc-Warning: generation-truncated` headers on non-streaming responses
+- **Repetition detection** — `proxy.py`: `detect_repetition()` sliding-window function; streaming `_gen()` checks every 20 chunks; abort mode injects error SSE sentinel; warn mode logs only; non-streaming path checks post-hoc with `X-Orc-Warning: repetition-detected` header
+- **Metrics** — `metrics.py`: `empty_responses` counter and `finish_reason_counts` dict added to `ModelMetrics`; Prometheus metrics updated; JSON snapshot round-trip updated
+- **DB** — `db.py`: `finish_reason TEXT` column with ALTER TABLE migration; `query_history()` includes finish_reason distribution
+- **Config** — `config.py`: `repeat_detection_window`, `repeat_detection_threshold`, `repeat_detection_action`; `.env.example` updated
+- **Tests** — 73 tests total (17 new); covers detect_repetition, streaming abort/warn/disabled, finish_reason, empty responses, snapshot round-trip
+- Version bumped to 0.8.0
+- Updated README.md: new env vars, error type, output quality safeguards section
+- Updated CLAUDE.md: Phase 8 description, session log
